@@ -64,6 +64,14 @@ func (ct *CostTracker) Session() CostInfo {
 	}
 }
 
+// SetPricing updates the per-1M-token prices.
+func (ct *CostTracker) SetPricing(inputPricePerMillion, outputPricePerMillion float64) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	ct.inputPrice = inputPricePerMillion
+	ct.outputPrice = outputPricePerMillion
+}
+
 // Reset clears all session totals.
 func (ct *CostTracker) Reset() {
 	ct.mu.Lock()

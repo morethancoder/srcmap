@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -67,6 +68,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	reg := parser.NewRegistry()
+	handler := mcp.NewToolHandler(db, ".srcmap")
 
 	for _, r := range results {
 		if r.Err != nil {
@@ -108,6 +110,15 @@ func runFetch(cmd *cobra.Command, args []string) error {
 			indexed++
 		}
 		fmt.Printf("  indexed %d symbols\n", indexed)
+
+		summary, derr := handler.AutoIngestLocalDocs(ctx, r.Source.Name, r.Source.Path)
+		if derr != nil {
+			fmt.Fprintf(os.Stderr, "  docs: %v\n", derr)
+		} else {
+			for _, ln := range strings.Split(summary, "\n") {
+				fmt.Printf("  %s\n", ln)
+			}
+		}
 	}
 
 	return nil
@@ -332,13 +343,28 @@ func runSources(cmd *cobra.Command, args []string) error {
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
+	ensureSrcmapDir()
+
 	db, err := openDB()
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer db.Close()
 
+	cwd, _ := os.Getwd()
+	cfg, _ := config.Load(config.ConfigPath(true))
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
+
 	handler := mcp.NewToolHandler(db, ".srcmap")
+	handler.Orchestrator = fetcher.NewOrchestrator(cwd, globalPath)
+	handler.ParserRegistry = parser.NewRegistry()
+
 	server := mcp.NewStdioServer(handler, os.Stdin, os.Stdout)
 	return server.Serve(context.Background())
 }
@@ -346,14 +372,45 @@ func runMCP(cmd *cobra.Command, args []string) error {
 func runAgent(cmd *cobra.Command, args []string) error {
 	ensureSrcmapDir()
 
+	// Try env var first, then config file
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	cfgPath := config.ConfigPath(true)
+	cfg, _ := config.Load(cfgPath)
+
+	if apiKey == "" && cfg != nil {
+		apiKey = cfg.OpenRouterAPIKey
+	}
+
 	if apiKey == "" {
-		return fmt.Errorf("OPENROUTER_API_KEY environment variable is required")
+		fmt.Println("No OpenRouter API key found.")
+		fmt.Print("Enter your OpenRouter API key: ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			return fmt.Errorf("no API key provided")
+		}
+		apiKey = strings.TrimSpace(scanner.Text())
+		if apiKey == "" {
+			return fmt.Errorf("no API key provided")
+		}
+
+		// Save to global config for future use
+		if cfg == nil {
+			cfg = &config.Config{}
+		}
+		cfg.OpenRouterAPIKey = apiKey
+		if err := cfg.Save(cfgPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not save API key to config: %v\n", err)
+		} else {
+			fmt.Printf("API key saved to %s\n\n", cfgPath)
+		}
 	}
 
 	modelID := os.Getenv("OPENROUTER_MODEL")
+	if modelID == "" && cfg != nil && cfg.Model != "" {
+		modelID = cfg.Model
+	}
 	if modelID == "" {
-		modelID = "anthropic/claude-3.5-sonnet"
+		modelID = "minimax/minimax-m2.5"
 	}
 
 	db, err := openDB()
@@ -362,10 +419,24 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
+	cwd, _ := os.Getwd()
+	localCfg, _ := config.Load(config.ConfigPath(false))
+	globalPath := cfg.GlobalPath
+	if globalPath == "" && localCfg != nil {
+		globalPath = localCfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
+
 	handler := mcp.NewToolHandler(db, ".srcmap")
+	handler.Orchestrator = fetcher.NewOrchestrator(cwd, globalPath)
+	handler.ParserRegistry = parser.NewRegistry()
+
 	client := agent.NewOpenRouterClient(apiKey)
 	costTracker := agent.NewCostTracker(0, 0)
 	chat := agent.NewChat(client, handler, modelID, costTracker)
+	chat.ConfigPath = cfgPath
 
 	return chat.Run(context.Background())
 }

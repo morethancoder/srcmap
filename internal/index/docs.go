@@ -42,6 +42,63 @@ func (db *DB) UpdateChunkStatus(chunkID int64, status docfetcher.ChunkStatus) er
 	return nil
 }
 
+// GetChunk retrieves a single chunk by ID.
+func (db *DB) GetChunk(chunkID int64) (*docfetcher.Chunk, error) {
+	row := db.conn.QueryRow(
+		`SELECT id, source_id, page_url, chunk_index, heading, content,
+		        estimated_tokens, fingerprint, status
+		 FROM chunks WHERE id = ?`, chunkID,
+	)
+	var c docfetcher.Chunk
+	var status string
+	if err := row.Scan(&c.ID, &c.SourceID, &c.PageURL, &c.ChunkIndex, &c.Heading,
+		&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status); err != nil {
+		return nil, fmt.Errorf("getting chunk: %w", err)
+	}
+	c.Status = docfetcher.ChunkStatus(status)
+	return &c, nil
+}
+
+// GetPendingChunks retrieves all pending chunks for a source.
+func (db *DB) GetPendingChunks(sourceID string) ([]docfetcher.Chunk, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, source_id, page_url, chunk_index, heading, content,
+		        estimated_tokens, fingerprint, status
+		 FROM chunks WHERE source_id = ? AND status = ?
+		 ORDER BY id ASC`,
+		sourceID, string(docfetcher.ChunkPending),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying pending chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var chunks []docfetcher.Chunk
+	for rows.Next() {
+		var c docfetcher.Chunk
+		var status string
+		if err := rows.Scan(&c.ID, &c.SourceID, &c.PageURL, &c.ChunkIndex, &c.Heading,
+			&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status); err != nil {
+			continue
+		}
+		c.Status = docfetcher.ChunkStatus(status)
+		chunks = append(chunks, c)
+	}
+	return chunks, rows.Err()
+}
+
+// UpdateSourceCounts refreshes section/concept/gotcha counts from the doc files on disk.
+func (db *DB) UpdateSourceCounts(sourceID string, sections, concepts, gotchas int) error {
+	_, err := db.conn.Exec(
+		`UPDATE sources SET section_count = ?, concept_count = ?, gotcha_count = ? WHERE id = ?`,
+		sections, concepts, gotchas, sourceID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating source counts: %w", err)
+	}
+	return nil
+}
+
 // ChunkCounts returns the number of chunks in each status for a source.
 func (db *DB) ChunkCounts(sourceID string) (pending, processed, failed int, err error) {
 	rows, err := db.conn.Query(

@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	maxTokens     = 3000
-	minTokens     = 400
-	maxBatchSize  = 5
-	flatProseMax  = 1000
-	tokenPerWord  = 1.3
+	maxTokens    = 8000
+	minTokens    = 1000
+	maxBatchSize = 10
+	flatProseMax = 4000
+	tokenPerWord = 1.3
 )
 
 // DocType classifies the structure of a document for chunking.

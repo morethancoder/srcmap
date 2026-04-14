@@ -17,7 +17,6 @@ import (
 )
 
 func TestOpenRouterModelFilter(t *testing.T) {
-	// Mock /models response
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": []map[string]interface{}{
@@ -40,7 +39,6 @@ func TestOpenRouterModelFilter(t *testing.T) {
 		t.Fatalf("list models: %v", err)
 	}
 
-	// Should only include models with >= 32k context
 	for _, m := range models {
 		if m.ContextLength < 32000 {
 			t.Errorf("model %q has context %d, should be filtered out", m.ID, m.ContextLength)
@@ -53,7 +51,6 @@ func TestOpenRouterModelFilter(t *testing.T) {
 }
 
 func TestCostCalculation(t *testing.T) {
-	// $3/1M input, $15/1M output
 	ct := agent.NewCostTracker(3.0, 15.0)
 
 	ct.Record(1000, 500)
@@ -110,7 +107,6 @@ func TestToolUseLoop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
 		if callCount == 1 {
-			// Return a tool call
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"choices": []map[string]interface{}{
 					{
@@ -132,7 +128,6 @@ func TestToolUseLoop(t *testing.T) {
 				"usage": map[string]int{"prompt_tokens": 100, "completion_tokens": 20},
 			})
 		} else {
-			// Return final text
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"choices": []map[string]interface{}{
 					{
@@ -148,7 +143,6 @@ func TestToolUseLoop(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Set up test DB and handler
 	dir := t.TempDir()
 	db, _ := index.Open(filepath.Join(dir, "test.db"))
 	defer db.Close()
@@ -160,7 +154,7 @@ func TestToolUseLoop(t *testing.T) {
 	ct := agent.NewCostTracker(3.0, 15.0)
 	loop := agent.NewToolLoop(client, handler, "test-model", ct)
 
-	response, err := loop.SendMessage(context.Background(), "Tell me about test source")
+	response, err := loop.SendMessage(context.Background(), "Tell me about test source", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -185,7 +179,9 @@ func TestMultiTurnContext(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		var req agent.ChatRequest
+		var req struct {
+			Messages []interface{} `json:"messages"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		lastMessages = len(req.Messages)
 
@@ -208,9 +204,9 @@ func TestMultiTurnContext(t *testing.T) {
 	ct := agent.NewCostTracker(3.0, 15.0)
 	loop := agent.NewToolLoop(client, handler, "test-model", ct)
 
-	loop.SendMessage(context.Background(), "message 1")
-	loop.SendMessage(context.Background(), "message 2")
-	loop.SendMessage(context.Background(), "message 3")
+	loop.SendMessage(context.Background(), "message 1", nil)
+	loop.SendMessage(context.Background(), "message 2", nil)
+	loop.SendMessage(context.Background(), "message 3", nil)
 
 	// 3rd call sends: system + user1 + assistant1 + user2 + assistant2 + user3 = 6
 	if lastMessages != 6 {

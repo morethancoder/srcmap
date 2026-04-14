@@ -328,7 +328,7 @@ func TestChunkerMaxTokenEnforced(t *testing.T) {
 	// Create large content with paragraph breaks (~5000 tokens = ~3800 words)
 	// Use paragraph breaks so flat-prose splitting can work
 	var paragraphs []string
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 100; i++ {
 		words := make([]string, 100)
 		for j := range words {
 			words[j] = "word"
@@ -350,7 +350,7 @@ func TestChunkerMaxTokenEnforced(t *testing.T) {
 
 	for i, c := range chunks {
 		totalTokens := int(float64(len(strings.Fields(c.Content))) * 1.3)
-		if totalTokens > 3500 { // max chunk + header overhead
+		if totalTokens > 9000 { // max chunk (8000) + header overhead
 			t.Errorf("chunk %d has ~%d tokens, exceeds max", i, totalTokens)
 		}
 	}
@@ -429,9 +429,9 @@ func TestChunkerOpenAPIPassthrough(t *testing.T) {
 }
 
 func TestChunkerFlatProse(t *testing.T) {
-	// Build content with no headings, multiple paragraphs
+	// Build content with no headings, multiple paragraphs — needs enough to exceed flatProseMax (4000 tokens)
 	var paragraphs []string
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 60; i++ {
 		words := make([]string, 100)
 		for j := range words {
 			words[j] = "word"
@@ -451,10 +451,10 @@ func TestChunkerFlatProse(t *testing.T) {
 		t.Fatalf("expected multiple chunks for large flat prose, got %d", len(chunks))
 	}
 
-	// No chunk body should exceed flatProseMax significantly
+	// No chunk body should exceed maxTokens significantly
 	for i, c := range chunks {
 		bodyTokens := int(float64(len(strings.Fields(c.Content))) * 1.3)
-		if bodyTokens > 3200 {
+		if bodyTokens > 9000 {
 			t.Errorf("chunk %d has ~%d tokens, too large", i, bodyTokens)
 		}
 	}
