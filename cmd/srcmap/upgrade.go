@@ -11,15 +11,19 @@ import (
 // srcmapModulePath is the canonical import path users run `go install` against.
 const srcmapModulePath = "github.com/morethancoder/srcmap/cmd/srcmap"
 
-var selfUpdateCmd = &cobra.Command{
-	Use:   "self-update",
-	Short: "Re-install srcmap from the latest GitHub release",
-	Long: `Runs the Go toolchain to pull the latest published srcmap from GitHub:
+var upgradeCmd = &cobra.Command{
+	Use:   "upgrade",
+	Short: "Upgrade the srcmap binary to the latest GitHub release",
+	Long: `Pull the latest published srcmap from GitHub and re-install it:
 
     go install ` + srcmapModulePath + `@latest
 
 Requires the Go toolchain on $PATH. The new binary lands in $GOBIN
-(or $GOPATH/bin), which is where the shell picked up the current one.`,
+(or $GOPATH/bin), which is where the shell picked up the current one.
+
+Note: "srcmap update <source>" updates an indexed package's symbols and
+docs — that's a different command. This one upgrades the srcmap tool
+itself.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		goBin, err := exec.LookPath("go")
 		if err != nil {
@@ -37,11 +41,11 @@ Requires the Go toolchain on $PATH. The new binary lands in $GOBIN
 		}
 
 		fmt.Println()
-		fmt.Println("✓ srcmap updated — run `srcmap version` to confirm")
+		fmt.Println("✓ srcmap upgraded — run `srcmap version` to confirm")
 		return nil
 	},
 }
 
 func init() {
-	rootCmd.AddCommand(selfUpdateCmd)
+	rootCmd.AddCommand(upgradeCmd)
 }

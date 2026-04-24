@@ -106,8 +106,8 @@ var versionCmd = &cobra.Command{
 	Short: "Print the srcmap version and how to update it",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf("srcmap %s\n\n", resolvedVersion())
-		fmt.Println("Update with:")
-		fmt.Println("  srcmap self-update")
+		fmt.Println("Upgrade with:")
+		fmt.Println("  srcmap upgrade")
 		fmt.Println("  # or: go install " + srcmapModulePath + "@latest")
 		return nil
 	},

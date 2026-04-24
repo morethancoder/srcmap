@@ -35,10 +35,10 @@ go build -o srcmap ./cmd/srcmap
 # or: make install  (installs to $GOPATH/bin)
 ```
 
-### Updating
+### Upgrading
 
 ```bash
-srcmap self-update                                              # from anywhere
+srcmap upgrade                                                  # from anywhere
 # equivalent to:
 go install github.com/morethancoder/srcmap/cmd/srcmap@latest
 
@@ -46,7 +46,9 @@ go install github.com/morethancoder/srcmap/cmd/srcmap@latest
 make update
 ```
 
-`srcmap version` prints the currently installed version and repeats the update command so you never have to remember it.
+`srcmap version` prints the currently installed version and repeats the upgrade command so you never have to remember it.
+
+> `srcmap upgrade` upgrades the tool itself. `srcmap update <source>` is a different command — it re-clones and re-indexes one of your tracked packages.
 
 ## Quick Start
 
