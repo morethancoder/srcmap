@@ -64,9 +64,18 @@ func ParsePackageName(input string, global bool) FetchRequest {
 	if strings.HasPrefix(input, "pypi:") {
 		return FetchRequest{Name: strings.TrimPrefix(input, "pypi:"), Type: PackagePyPI, Global: global}
 	}
+	if strings.HasPrefix(input, "npm:") {
+		return FetchRequest{Name: strings.TrimPrefix(input, "npm:"), Type: PackageNPM, Global: global}
+	}
 	if strings.HasPrefix(input, "crates:") {
 		// Not implemented yet, but parsed
 		return FetchRequest{Name: strings.TrimPrefix(input, "crates:"), Type: "crates", Global: global}
+	}
+	// Scoped npm packages (@scope/pkg) always contain '/' and may contain '.'
+	// in the scope — route them to npm before the slash-based GitHub/Go-module
+	// heuristic, which would otherwise misroute them.
+	if strings.HasPrefix(input, "@") {
+		return FetchRequest{Name: input, Type: PackageNPM, Global: global}
 	}
 	if strings.Contains(input, "/") {
 		// Could be Go module or GitHub shorthand

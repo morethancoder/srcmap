@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -41,9 +42,12 @@ func (r *NPMRegistry) client() *http.Client {
 
 // Resolve looks up an npm package and returns its repo URL and latest version.
 func (r *NPMRegistry) Resolve(ctx context.Context, name string) (*RegistryResult, error) {
-	url := fmt.Sprintf("%s/%s", r.baseURL(), name)
+	// npm's registry requires scoped packages to be URL-encoded
+	// (e.g. @scope/pkg → %40scope%2Fpkg). PathEscape is a no-op for
+	// plain names like "zod", so this is safe for all cases.
+	requestURL := fmt.Sprintf("%s/%s", r.baseURL(), url.PathEscape(name))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/morethancoder/srcmap/internal/fetcher"
@@ -40,6 +41,45 @@ func TestNPMRegistryLookup(t *testing.T) {
 	}
 	if result.Version != "3.22.4" {
 		t.Errorf("version: got %q, want %q", result.Version, "3.22.4")
+	}
+}
+
+// TestNPMRegistryScopedPackage verifies that scoped npm packages
+// (@scope/pkg) hit the registry with the URL-encoded form required by
+// npm's API, and that the resolved metadata is parsed correctly.
+func TestNPMRegistryScopedPackage(t *testing.T) {
+	var gotEscapedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscapedPath = r.URL.EscapedPath()
+		// r.URL.Path is the decoded form — match on that for correctness.
+		if r.URL.Path != "/@tma.js/sdk" {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"repository": map[string]string{
+				"type": "git",
+				"url":  "git+https://github.com/Telegram-Mini-Apps/telegram-apps.git",
+			},
+			"dist-tags": map[string]string{"latest": "2.0.0"},
+		})
+	}))
+	defer srv.Close()
+
+	reg := &fetcher.NPMRegistry{BaseURL: srv.URL}
+	result, err := reg.Resolve(context.Background(), "@tma.js/sdk")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// The slash inside a scoped name must be URL-encoded per npm's registry
+	// docs; %2F (case-insensitive) is the canonical form.
+	lower := strings.ToLower(gotEscapedPath)
+	if !strings.Contains(lower, "%2f") {
+		t.Errorf("expected URL-encoded slash in path, got %q", gotEscapedPath)
+	}
+	if result.Version != "2.0.0" {
+		t.Errorf("version: got %q, want %q", result.Version, "2.0.0")
 	}
 }
 
@@ -154,8 +194,13 @@ func TestParsePackageName(t *testing.T) {
 	}{
 		{"zod", fetcher.PackageNPM},
 		{"pypi:requests", fetcher.PackagePyPI},
+		{"npm:zod", fetcher.PackageNPM},
 		{"github.com/spf13/cobra", fetcher.PackageGoMod},
 		{"owner/repo", fetcher.PackageGitHub},
+		// Scoped npm packages: must route to npm even when the scope contains
+		// a "." (regression: used to be misrouted to Go modules / GitHub).
+		{"@tma.js/sdk", fetcher.PackageNPM},
+		{"@scope/pkg", fetcher.PackageNPM},
 	}
 
 	for _, tt := range tests {
