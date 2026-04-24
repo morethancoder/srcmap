@@ -65,13 +65,37 @@ func (h *ToolHandler) AllTools() []Tool {
 		},
 		{
 			Name:        "srcmap_doc_map",
-			Description: "Return the root index.md for a source, showing all sections and their descriptions.",
+			Description: "Return the root index.md for a source, showing all sections and their descriptions. If no map exists, the response tells you to call srcmap_write_map to create one.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"source": map[string]string{"type": "string", "description": "Source ID"},
 				},
 				"required": []string{"source"},
+			},
+		},
+		{
+			Name:        "srcmap_write_map",
+			Description: "Create or overwrite the root index.md for a source. Use this AFTER srcmap_fetch or srcmap_docs_add so future agents can navigate map → section → method/concept. Provide a short curated description per section instead of letting the auto-generated 'Documentation for X' stubs stand. Any existing <!-- custom --> blocks in index.md are preserved.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"source":   map[string]string{"type": "string", "description": "Source ID (e.g. 'zod') as reported by srcmap_list_sources."},
+					"overview": map[string]string{"type": "string", "description": "Optional 1-3 sentence overview of what this source is and when to use it."},
+					"sections": map[string]interface{}{
+						"type":        "array",
+						"description": "Ordered list of sections to show in the map.",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"name":        map[string]string{"type": "string", "description": "Section name — should match an existing directory under .srcmap/docs/<source>/."},
+								"description": map[string]string{"type": "string", "description": "One-line description of what's in this section."},
+							},
+							"required": []string{"name", "description"},
+						},
+					},
+				},
+				"required": []string{"source", "sections"},
 			},
 		},
 		{
@@ -257,6 +281,8 @@ func (h *ToolHandler) dispatchTool(ctx context.Context, name string, args map[st
 		return h.handleSearchCode(args)
 	case "srcmap_doc_map":
 		return h.handleDocMap(args)
+	case "srcmap_write_map":
+		return h.handleWriteMap(args)
 	case "srcmap_doc_section":
 		return h.handleDocSection(args)
 	case "srcmap_doc_lookup":
@@ -331,11 +357,98 @@ func (h *ToolHandler) handleSearchCode(args map[string]interface{}) (*ToolResult
 
 func (h *ToolHandler) handleDocMap(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
+	if source == "" {
+		return textError("source is required"), nil
+	}
 	path := filepath.Join(h.SrcmapDir, "docs", source, "index.md")
 	if _, err := os.Stat(path); err != nil {
 		h.rebuildIndexFiles(source)
 	}
+	if _, err := os.Stat(path); err != nil {
+		// Still no map and nothing to rebuild from — tell the agent what to
+		// do next instead of failing silently.
+		return &ToolResult{
+			Content: []ContentBlock{{Type: "text", Text: fmt.Sprintf(
+				"No map exists yet for source %q.\n\n"+
+					"This source has no curated doc hierarchy. To create one, pick the path that fits:\n\n"+
+					"  • Docs not yet ingested → call srcmap_docs_add(source=%q, url=<docs URL>) to fetch and chunk them.\n"+
+					"  • Ingested but un-curated → call srcmap_write_map(source=%q, sections=[...]) to write a real index.md.\n"+
+					"  • Code-only source       → call srcmap_list_sources to confirm scope, then srcmap_write_map with one section per top-level module.\n\n"+
+					"After writing the map, retry srcmap_doc_map to navigate sections → methods/concepts.",
+				source, source, source)}},
+		}, nil
+	}
 	return readFileResult(path)
+}
+
+// handleWriteMap lets the agent write a curated root index.md for a source,
+// replacing the auto-generated "Documentation for X" stubs with real
+// descriptions. Existing <!-- custom --> blocks in the file are preserved.
+func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, error) {
+	source, _ := args["source"].(string)
+	if source == "" {
+		return textError("source is required"), nil
+	}
+	overview, _ := args["overview"].(string)
+	rawSections, _ := args["sections"].([]interface{})
+	if len(rawSections) == 0 {
+		return textError("sections is required and must be a non-empty array"), nil
+	}
+
+	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
+	var summaries []fileformat.SectionSummary
+	var skipped []string
+	for _, raw := range rawSections {
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := obj["name"].(string)
+		desc, _ := obj["description"].(string)
+		if name == "" || desc == "" {
+			continue
+		}
+		// Warn the agent about sections without a matching on-disk directory,
+		// but still include them so the agent can pre-author sections it
+		// plans to create.
+		if _, err := os.Stat(filepath.Join(docsDir, sanitizeSection(name))); err != nil {
+			skipped = append(skipped, name)
+		}
+		summaries = append(summaries, fileformat.SectionSummary{
+			Name:        name,
+			Description: desc,
+		})
+	}
+	if len(summaries) == 0 {
+		return textError("no valid section entries provided (each needs a non-empty name and description)"), nil
+	}
+
+	hb := fileformat.NewHierarchyBuilder(h.SrcmapDir, source)
+	if err := hb.EnsureStructure(); err != nil {
+		return textError(fmt.Sprintf("ensuring docs dir: %v", err)), nil
+	}
+
+	// Persist the overview in a <!-- custom --> block so subsequent auto
+	// rebuilds of index.md don't wipe it.
+	if strings.TrimSpace(overview) != "" {
+		indexPath := filepath.Join(docsDir, "index.md")
+		existing, _ := os.ReadFile(indexPath)
+		if !strings.Contains(string(existing), "<!-- custom -->") {
+			overviewBlock := "<!-- custom -->\n## Overview\n\n" + strings.TrimSpace(overview) + "\n<!-- /custom -->\n"
+			_ = os.WriteFile(indexPath, []byte(overviewBlock), 0o644)
+		}
+	}
+
+	if err := hb.WriteIndex(summaries); err != nil {
+		return textError(fmt.Sprintf("writing index: %v", err)), nil
+	}
+
+	msg := fmt.Sprintf("✓ Wrote curated map for %q with %d section(s) → %s/index.md", source, len(summaries), docsDir)
+	if len(skipped) > 0 {
+		msg += fmt.Sprintf("\n\nWarning: these section names have no matching directory and their links will 404 until you create them:\n  - %s", strings.Join(skipped, "\n  - "))
+	}
+	msg += fmt.Sprintf("\n\nNext: call srcmap_doc_map(source=%q) to verify, then srcmap_doc_section on each section.", source)
+	return &ToolResult{Content: []ContentBlock{{Type: "text", Text: msg}}}, nil
 }
 
 func (h *ToolHandler) handleDocSection(args map[string]interface{}) (*ToolResult, error) {
@@ -383,8 +496,14 @@ func (h *ToolHandler) rebuildIndexFiles(source string) {
 func (h *ToolHandler) handleDocLookup(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
 	method, _ := args["method"].(string)
-	// Search for the method file across sections
-	return h.findDocFile(source, "methods", method)
+	// Search for the method file across sections. If nothing matches, fall
+	// through to concepts/ since section.md links mix both kinds and the
+	// agent may not know which one a given name is.
+	res, _ := h.findDocFile(source, "methods", method)
+	if res != nil && !res.IsError {
+		return res, nil
+	}
+	return h.findDocFile(source, "concepts", method)
 }
 
 func (h *ToolHandler) handleDocConcept(args map[string]interface{}) (*ToolResult, error) {
