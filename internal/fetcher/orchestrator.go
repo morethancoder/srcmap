@@ -14,8 +14,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// DefaultResolveTimeout caps registry metadata lookups.
-const DefaultResolveTimeout = 20 * time.Second
+// DefaultResolveTimeout caps registry metadata lookups. npm metadata for
+// popular packages (antd-mobile, react, etc.) can be 2+ MB of every-version
+// history, so the budget has to cover a slow transfer plus JSON decode
+// rather than a fast small request.
+const DefaultResolveTimeout = 60 * time.Second
 
 // PackageType identifies the ecosystem of a package.
 type PackageType string
