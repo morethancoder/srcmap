@@ -65,7 +65,13 @@ func (h *HierarchyBuilder) WriteSection(sectionName string, methods []MethodSumm
 	var body strings.Builder
 	body.WriteString(fmt.Sprintf("\n# %s\n\n", sectionName))
 	for _, m := range methods {
-		body.WriteString(fmt.Sprintf("- **[%s](methods/%s.md)** — %s\n", m.Name, sanitizeName(m.Name), m.Summary))
+		// Route each entry to the subdirectory its file actually lives in.
+		// Kind "concept" → concepts/, anything else → methods/ (default).
+		subdir := "methods"
+		if m.Kind == "concept" {
+			subdir = "concepts"
+		}
+		body.WriteString(fmt.Sprintf("- **[%s](%s/%s.md)** — %s\n", m.Name, subdir, sanitizeName(m.Name), m.Summary))
 	}
 
 	return h.writeDocFile(filepath.Join(sectionDir, "section.md"), &DocFile{
@@ -163,6 +169,9 @@ type SectionSummary struct {
 type MethodSummary struct {
 	Name    string
 	Summary string
+	// Kind is "method" or "concept" — decides whether the section.md link
+	// points into methods/ or concepts/. Empty defaults to "method".
+	Kind string
 }
 
 var customBlockRe = regexp.MustCompile(`(?s)<!-- custom -->(.*?)<!-- /custom -->`)

@@ -761,6 +761,7 @@ func (h *ToolHandler) writeSectionFiles(source string, hb *fileformat.HierarchyB
 			if err != nil {
 				continue
 			}
+			singular := kind[:len(kind)-1] // "method" or "concept"
 			for _, f := range files {
 				if f.IsDir() || filepath.Ext(f.Name()) != ".md" {
 					continue
@@ -768,7 +769,8 @@ func (h *ToolHandler) writeSectionFiles(source string, hb *fileformat.HierarchyB
 				name := strings.TrimSuffix(f.Name(), ".md")
 				summaries = append(summaries, fileformat.MethodSummary{
 					Name:    name,
-					Summary: kind[:len(kind)-1], // "method" or "concept"
+					Summary: singular,
+					Kind:    singular,
 				})
 			}
 		}
