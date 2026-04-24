@@ -138,9 +138,11 @@ Scopes per tool:
 
 | Tool        | `--scope user` (default)                       | `--scope project`          |
 | ----------- | ---------------------------------------------- | -------------------------- |
-| Claude Code | `~/.claude/settings.json`                      | `./.mcp.json`              |
+| Claude Code | `~/.claude.json` (top-level `mcpServers`)      | `./.mcp.json`              |
 | Cursor      | `~/.cursor/mcp.json`                           | `./.cursor/mcp.json`       |
 | Windsurf    | `~/.codeium/windsurf/mcp_config.json`          | _not supported_            |
+
+For Claude Code, srcmap merges its entry into the existing `~/.claude.json` and leaves every other field in that file untouched.
 
 Restart your AI tool after running the installer, then verify srcmap is connected (in Claude Code, run `/mcp`).
 

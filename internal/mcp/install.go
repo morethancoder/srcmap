@@ -28,6 +28,7 @@ const (
 )
 
 // Install writes the MCP server configuration for the given target and scope.
+// Returns the path that was written.
 func Install(target InstallTarget, scope InstallScope) (string, error) {
 	if scope == "" {
 		scope = ScopeUser
@@ -59,6 +60,9 @@ func DetectTarget() InstallTarget {
 	if _, err := os.Stat(filepath.Join(home, ".claude")); err == nil {
 		return TargetClaudeCode
 	}
+	if _, err := os.Stat(filepath.Join(home, ".claude.json")); err == nil {
+		return TargetClaudeCode
+	}
 	// Check for Cursor
 	if _, err := os.Stat(filepath.Join(home, ".cursor")); err == nil {
 		return TargetCursor
@@ -83,15 +87,6 @@ func findBinary() (string, error) {
 	return "srcmap", nil
 }
 
-type mcpConfig struct {
-	MCPServers map[string]mcpServerConfig `json:"mcpServers"`
-}
-
-type mcpServerConfig struct {
-	Command string   `json:"command"`
-	Args    []string `json:"args"`
-}
-
 func configPathFor(target InstallTarget, scope InstallScope) (string, error) {
 	home, _ := os.UserHomeDir()
 
@@ -99,7 +94,9 @@ func configPathFor(target InstallTarget, scope InstallScope) (string, error) {
 	case TargetClaudeCode:
 		switch scope {
 		case ScopeUser:
-			return filepath.Join(home, ".claude", "settings.json"), nil
+			// Claude Code reads user-scope MCP servers from ~/.claude.json
+			// top-level "mcpServers" key, NOT ~/.claude/settings.json.
+			return filepath.Join(home, ".claude.json"), nil
 		case ScopeProject:
 			return ".mcp.json", nil
 		}
@@ -119,29 +116,33 @@ func configPathFor(target InstallTarget, scope InstallScope) (string, error) {
 	return "", fmt.Errorf("unknown target: %s", target)
 }
 
+// writeMCPConfig merges the srcmap entry into the target JSON file's
+// "mcpServers" map, preserving every other top-level field. This matters
+// especially for ~/.claude.json, which holds unrelated Claude Code state.
 func writeMCPConfig(configPath, binaryPath string) error {
-	// Read existing config if present
-	var config mcpConfig
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &config) // best-effort parse of existing config
-	}
-	if config.MCPServers == nil {
-		config.MCPServers = make(map[string]mcpServerConfig)
+	raw := map[string]interface{}{}
+	if data, err := os.ReadFile(configPath); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parsing existing config %s: %w", configPath, err)
+		}
 	}
 
-	config.MCPServers["srcmap"] = mcpServerConfig{
-		Command: binaryPath,
-		Args:    []string{"mcp"},
+	servers, _ := raw["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		servers = map[string]interface{}{}
 	}
+	servers["srcmap"] = map[string]interface{}{
+		"command": binaryPath,
+		"args":    []string{"mcp"},
+	}
+	raw["mcpServers"] = servers
 
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 		return err
 	}
-
-	data, err := json.MarshalIndent(config, "", "  ")
+	data, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(configPath, data, 0o644)
 }
