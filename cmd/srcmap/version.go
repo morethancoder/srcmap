@@ -3,26 +3,69 @@ package main
 import (
 	"fmt"
 	"runtime/debug"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
 
 // version is set via -ldflags "-X main.version=vX.Y.Z" at release time.
-// When built with `go install`, runtime/debug.ReadBuildInfo() supplies the
-// module version automatically, so this fallback is only hit for `go run`
-// or a plain `go build` from source.
-var version = "dev"
+// Otherwise we compose a human-readable version from VCS build info.
+var version = ""
 
+// resolvedVersion returns a short, human-friendly version string.
+//
+// Priority:
+//  1. ldflag override (e.g. "v0.1.2") — used by release builds.
+//  2. Clean module tag from `go install` (e.g. "v0.1.2").
+//  3. "dev <short-sha> (<date>[, modified])" composed from VCS info.
+//  4. "dev" if nothing is available.
 func resolvedVersion() string {
-	if version != "dev" && version != "" {
+	if version != "" {
 		return version
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		if v := info.Main.Version; v != "" && v != "(devel)" {
-			return v
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+
+	// Clean release tag (not a pseudo-version like v0.0.0-<ts>-<sha>).
+	if v := info.Main.Version; v != "" && v != "(devel)" && !strings.HasPrefix(v, "v0.0.0-") {
+		return v
+	}
+
+	var sha, date string
+	var modified bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			if len(s.Value) >= 7 {
+				sha = s.Value[:7]
+			} else {
+				sha = s.Value
+			}
+		case "vcs.time":
+			if t, err := time.Parse(time.RFC3339, s.Value); err == nil {
+				date = t.Format("2006-01-02")
+			}
+		case "vcs.modified":
+			modified = s.Value == "true"
 		}
 	}
-	return "dev"
+
+	if sha == "" {
+		return "dev"
+	}
+
+	parts := []string{sha}
+	if date != "" {
+		parts = append(parts, date)
+	}
+	if modified {
+		parts = append(parts, "modified")
+	}
+	return fmt.Sprintf("dev %s", strings.Join(parts, ", "))
 }
 
 var versionCmd = &cobra.Command{
