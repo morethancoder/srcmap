@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/morethancoder/srcmap/internal/httpx"
 )
 
 // PyPIRegistry resolves PyPI packages to their repository.
@@ -15,10 +17,10 @@ type PyPIRegistry struct {
 
 type pypiPackageResponse struct {
 	Info struct {
-		Version    string            `json:"version"`
-		ProjectURL string            `json:"project_url"`
+		Version     string            `json:"version"`
+		ProjectURL  string            `json:"project_url"`
 		ProjectURLs map[string]string `json:"project_urls"`
-		HomePage   string            `json:"home_page"`
+		HomePage    string            `json:"home_page"`
 	} `json:"info"`
 }
 
@@ -33,7 +35,7 @@ func (r *PyPIRegistry) client() *http.Client {
 	if r.Client != nil {
 		return r.Client
 	}
-	return http.DefaultClient
+	return httpx.Default()
 }
 
 // Resolve looks up a PyPI package and returns its repo URL and version.

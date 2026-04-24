@@ -24,14 +24,14 @@ func TestTypeScriptParser(t *testing.T) {
 	// ZodString.min, ZodString.max, ZodString.email (methods),
 	// parse (function), DEFAULT_ERROR (constant)
 	expected := map[string]parser.SymbolKind{
-		"ZodType":          parser.SymbolInterface,
-		"ZodTypeAny":       parser.SymbolType,
-		"ZodString":        parser.SymbolClass,
-		"ZodString.min":    parser.SymbolMethod,
-		"ZodString.max":    parser.SymbolMethod,
-		"ZodString.email":  parser.SymbolMethod,
-		"parse":            parser.SymbolFunction,
-		"DEFAULT_ERROR":    parser.SymbolConstant,
+		"ZodType":         parser.SymbolInterface,
+		"ZodTypeAny":      parser.SymbolType,
+		"ZodString":       parser.SymbolClass,
+		"ZodString.min":   parser.SymbolMethod,
+		"ZodString.max":   parser.SymbolMethod,
+		"ZodString.email": parser.SymbolMethod,
+		"parse":           parser.SymbolFunction,
+		"DEFAULT_ERROR":   parser.SymbolConstant,
 	}
 
 	found := make(map[string]parser.SymbolKind)

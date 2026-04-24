@@ -65,6 +65,40 @@ func (db *DB) GetSource(id string) (*SourceRecord, error) {
 	return &s, nil
 }
 
+// DeleteSource removes a source and all associated rows (chunks, doc files,
+// fingerprints, symbols). Cascade is manual because the schema has no
+// ON DELETE CASCADE. Runs in a transaction for atomicity.
+func (db *DB) DeleteSource(id string) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// doc_links references symbols(id); delete links for this source's symbols first.
+	if _, err := tx.Exec(
+		`DELETE FROM doc_links WHERE symbol_id IN (SELECT id FROM symbols WHERE source_id = ?)`,
+		id,
+	); err != nil {
+		return fmt.Errorf("delete doc_links: %w", err)
+	}
+
+	stmts := []string{
+		`DELETE FROM chunks_fts   WHERE source_id = ?`,
+		`DELETE FROM chunks       WHERE source_id = ?`,
+		`DELETE FROM doc_files    WHERE source_id = ?`,
+		`DELETE FROM fingerprints WHERE source_id = ?`,
+		`DELETE FROM symbols      WHERE source_id = ?`,
+		`DELETE FROM sources      WHERE id        = ?`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q, id); err != nil {
+			return fmt.Errorf("%s: %w", q, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // ListSources returns all sources, optionally filtered by scope.
 // Symbol counts are computed live from the symbols table.
 func (db *DB) ListSources(globalOnly bool) ([]SourceRecord, error) {

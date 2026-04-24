@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/morethancoder/srcmap/internal/docfetcher"
+	"github.com/morethancoder/srcmap/internal/fetcher"
 	"github.com/morethancoder/srcmap/internal/index"
 	"github.com/morethancoder/srcmap/internal/mcp"
 	"github.com/morethancoder/srcmap/internal/parser"
@@ -57,6 +58,7 @@ func TestMCPToolListing(t *testing.T) {
 		"srcmap_doc_section", "srcmap_doc_lookup", "srcmap_doc_concept",
 		"srcmap_doc_search", "srcmap_doc_gotchas", "srcmap_source_info",
 		"srcmap_process_chunk", "srcmap_process_status",
+		"srcmap_find", "srcmap_list_sources", "srcmap_delete_source",
 	}
 
 	names := make(map[string]bool)
@@ -67,6 +69,15 @@ func TestMCPToolListing(t *testing.T) {
 	for _, want := range expectedTools {
 		if !names[want] {
 			t.Errorf("missing tool %q", want)
+		}
+	}
+
+	// Fetch / update / outdated only appear when the orchestrator is wired
+	// up; the setupTestHandler leaves it nil, so make sure they are NOT
+	// advertised in that mode.
+	for _, notExpected := range []string{"srcmap_fetch", "srcmap_docs_add", "srcmap_update_source", "srcmap_outdated"} {
+		if names[notExpected] {
+			t.Errorf("tool %q should not appear when orchestrator is nil", notExpected)
 		}
 	}
 }
@@ -181,6 +192,55 @@ func TestMCPErrorHandling(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Error("expected error result for missing symbol")
+	}
+}
+
+func TestMCPToolListingWithOrchestrator(t *testing.T) {
+	handler, _ := setupTestHandler(t)
+	handler.Orchestrator = fetcher.NewOrchestrator("", "")
+
+	names := map[string]bool{}
+	for _, tl := range handler.AllTools() {
+		names[tl.Name] = true
+	}
+	for _, want := range []string{"srcmap_fetch", "srcmap_docs_add", "srcmap_ingest_local_docs", "srcmap_update_source", "srcmap_outdated"} {
+		if !names[want] {
+			t.Errorf("expected tool %q to appear when orchestrator is set", want)
+		}
+	}
+}
+
+func TestMCPUpdateRequiresExistingSource(t *testing.T) {
+	handler, _ := setupTestHandler(t)
+	handler.Orchestrator = fetcher.NewOrchestrator("", "")
+
+	res, err := handler.CallTool(context.Background(), "srcmap_update_source", map[string]interface{}{
+		"source": "does-not-exist",
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Errorf("expected error for missing source, got: %s", res.Content[0].Text)
+	}
+	if !strings.Contains(res.Content[0].Text, "srcmap_fetch") {
+		t.Errorf("error should hint at srcmap_fetch; got: %s", res.Content[0].Text)
+	}
+}
+
+func TestMCPRejectsPathTraversalSource(t *testing.T) {
+	handler, _ := setupTestHandler(t)
+
+	for _, bad := range []string{"../etc", "..\\windows", "a/b", "/abs/path", ".."} {
+		res, err := handler.CallTool(context.Background(), "srcmap_doc_map", map[string]interface{}{
+			"source": bad,
+		})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if !res.IsError {
+			t.Errorf("expected error for source %q, got success: %s", bad, res.Content[0].Text)
+		}
 	}
 }
 

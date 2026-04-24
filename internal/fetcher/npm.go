@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/morethancoder/srcmap/internal/httpx"
 )
 
 // NPMRegistry resolves npm packages to their GitHub repository.
@@ -37,7 +39,7 @@ func (r *NPMRegistry) client() *http.Client {
 	if r.Client != nil {
 		return r.Client
 	}
-	return http.DefaultClient
+	return httpx.Default()
 }
 
 // Resolve looks up an npm package and returns its repo URL and latest version.

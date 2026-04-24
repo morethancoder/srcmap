@@ -14,6 +14,7 @@ import (
 	"github.com/morethancoder/srcmap/internal/docfetcher"
 	"github.com/morethancoder/srcmap/internal/fetcher"
 	"github.com/morethancoder/srcmap/internal/index"
+	"github.com/morethancoder/srcmap/internal/logging"
 	"github.com/morethancoder/srcmap/internal/mcp"
 	"github.com/morethancoder/srcmap/internal/parser"
 	"github.com/morethancoder/srcmap/pkg/fileformat"
@@ -66,13 +67,20 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting working directory: %w", err)
 	}
 
-	orch := fetcher.NewOrchestrator(cwd, cfg.GlobalPath)
+	orch := fetcher.NewOrchestrator(cwd, globalPath)
 
 	var requests []fetcher.FetchRequest
 	for _, arg := range args {
@@ -87,7 +95,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	// --global we write to .srcmap/index.db as before.
 	var db *index.DB
 	if global {
-		db, err = openGlobalDB(resolveGlobalPath(cfg))
+		db, err = openGlobalDB(globalPath)
 	} else {
 		db, err = openDB()
 	}
@@ -123,13 +131,17 @@ func runFetch(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Parse and index symbols
+		parseT := logging.Stage("parse", "pkg", r.Source.Name, "path", r.Source.Path)
 		symbols, err := reg.ParseDirectory(r.Source.Path)
 		if err != nil {
+			parseT.Warn(err, "failed", "pkg", r.Source.Name)
 			fmt.Fprintf(os.Stderr, "  warning: failed to parse source: %v\n", err)
 			continue
 		}
 
+		if err := db.ClearSymbolsForSource(r.Source.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not clear old symbols: %v\n", err)
+		}
 		indexed := 0
 		for i := range symbols {
 			symbols[i].SourceID = r.Source.Name
@@ -138,9 +150,12 @@ func runFetch(cmd *cobra.Command, args []string) error {
 			}
 			indexed++
 		}
+		parseT.Done("pkg", r.Source.Name, "symbols_found", len(symbols), "symbols_indexed", indexed)
 		fmt.Printf("  indexed %d symbols\n", indexed)
 
+		ingestT := logging.Stage("docs.local", "pkg", r.Source.Name)
 		summary, derr := handler.AutoIngestLocalDocs(ctx, r.Source.Name, r.Source.Path)
+		ingestT.Done("pkg", r.Source.Name)
 		if derr != nil {
 			fmt.Fprintf(os.Stderr, "  docs: %v\n", derr)
 		} else {
@@ -167,15 +182,38 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	// Register source if not exists
 	db.InsertSource(&index.SourceRecord{
 		ID:          sourceName,
 		Name:        sourceName,
 		LastUpdated: time.Now().UTC().Format(time.RFC3339),
 	})
 
+	ctx := context.Background()
+	handler := mcp.NewToolHandler(db, ".srcmap")
+
+	// Delegate to the same handler the MCP server uses so CLI and agent
+	// behaviour stay identical.
+	if urlFlag != "" {
+		res, err := handler.CallTool(ctx, "srcmap_docs_add", map[string]interface{}{
+			"source": sourceName,
+			"url":    urlFlag,
+		})
+		if err != nil {
+			return err
+		}
+		// handleDocsAdd needs the orchestrator; it's nil here, so fall back to
+		// the direct single-file path below if we get the "not available" error.
+		if res != nil && !res.IsError {
+			for _, b := range res.Content {
+				fmt.Println(b.Text)
+			}
+			return nil
+		}
+	}
+
 	var pages []docfetcher.RawPage
 	var originURL string
+	var contentType string
 
 	switch {
 	case openapiFlag != "":
@@ -188,6 +226,7 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("parsing OpenAPI spec: %w", err)
 		}
+		contentType = "openapi"
 		fmt.Printf("Parsed %d operations from OpenAPI spec\n", len(pages))
 
 	case markdownFlag != "":
@@ -196,25 +235,57 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("walking markdown dir: %w", err)
 		}
+		contentType = "local-markdown"
 		fmt.Printf("Found %d markdown files\n", len(pages))
 
 	case urlFlag != "":
-		f := &docfetcher.SingleFileFetcher{}
-		page, err := f.Fetch(context.Background(), urlFlag)
-		if err != nil {
-			return fmt.Errorf("fetching URL: %w", err)
+		// Fallback path when no orchestrator: fetch and classify the URL
+		// in the same way the MCP version does.
+		disc := docfetcher.NewDiscoveryService()
+		result, derr := disc.ValidateAndClassify(ctx, urlFlag, "")
+		if derr != nil {
+			return fmt.Errorf("validating URL: %w", derr)
 		}
-		pages = []docfetcher.RawPage{*page}
+		if result.Found && (result.ContentType == docfetcher.ContentSingleMarkdown || result.ContentType == docfetcher.ContentLLMSIndex) {
+			f := &docfetcher.SingleFileFetcher{}
+			page, err := f.Fetch(ctx, urlFlag)
+			if err != nil {
+				return fmt.Errorf("fetching URL: %w", err)
+			}
+			pages = []docfetcher.RawPage{*page}
+			contentType = string(result.ContentType)
+		} else if result.Found && result.ContentType == docfetcher.ContentOpenAPI {
+			f := &docfetcher.SingleFileFetcher{}
+			page, err := f.Fetch(ctx, urlFlag)
+			if err != nil {
+				return fmt.Errorf("fetching URL: %w", err)
+			}
+			p := &docfetcher.OpenAPIParser{}
+			pages, err = p.Parse([]byte(page.Content))
+			if err != nil {
+				return fmt.Errorf("parsing OpenAPI: %w", err)
+			}
+			contentType = "openapi"
+		} else {
+			crawler := docfetcher.NewWebCrawler()
+			fmt.Printf("Crawling %s (depth=2, max %d pages)…\n", urlFlag, crawler.MaxPages)
+			crawled, err := crawler.Crawl(ctx, urlFlag, 2)
+			if err != nil {
+				return fmt.Errorf("crawling URL: %w", err)
+			}
+			pages = crawled
+			contentType = "scrape"
+		}
 		originURL = urlFlag
-		fmt.Printf("Fetched %d bytes from %s\n", len(page.Content), urlFlag)
+		fmt.Printf("Fetched %d page(s) from %s\n", len(pages), urlFlag)
 
 	default:
 		return fmt.Errorf("specify --url, --openapi, or --markdown")
 	}
 
-	// Chunk the content
 	chunker := &docfetcher.DefaultChunker{}
 	var chunks []docfetcher.Chunk
+	chunkT := logging.Stage("chunk", "source", sourceName, "pages", len(pages))
 	if originURL != "" {
 		chunks, err = chunker.ChunkWithOrigin(sourceName, originURL, pages)
 	} else {
@@ -223,8 +294,8 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("chunking: %w", err)
 	}
+	chunkT.Done("chunks", len(chunks))
 
-	// Store chunks in DB
 	for i := range chunks {
 		id, err := db.InsertChunk(&chunks[i])
 		if err != nil {
@@ -234,15 +305,18 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 		chunks[i].ID = id
 	}
 
-	// Write source.yaml
 	srcmapDir := ".srcmap"
-	sy := &fileformat.SourceYAML{
-		Name: sourceName,
-	}
+	sy := &fileformat.SourceYAML{Name: sourceName}
 	if originURL != "" {
 		sy.DocOrigin = &fileformat.DocOrigin{
 			URL:          originURL,
-			ContentType:  "single-markdown",
+			ContentType:  contentType,
+			DiscoveredAt: time.Now().UTC().Format(time.RFC3339),
+			Validated:    true,
+		}
+	} else if contentType != "" {
+		sy.DocOrigin = &fileformat.DocOrigin{
+			ContentType:  contentType,
 			DiscoveredAt: time.Now().UTC().Format(time.RFC3339),
 			Validated:    true,
 		}
@@ -251,8 +325,15 @@ func runDocsAdd(cmd *cobra.Command, args []string) error {
 	hb.EnsureStructure()
 	fileformat.WriteSourceYAML(filepath.Join(srcmapDir, "docs", sourceName, "source.yaml"), sy)
 
-	fmt.Printf("✓ %d chunks stored (status: pending) for %s\n", len(chunks), sourceName)
-	fmt.Printf("  Run agent to process chunks: srcmap agent\n")
+	fmt.Printf("✓ %d chunks stored for %s — processing now…\n", len(chunks), sourceName)
+
+	// Auto-process so the user ends up with queryable doc files immediately.
+	res, err := handler.CallTool(ctx, "srcmap_process_all", map[string]interface{}{"source": sourceName})
+	if err == nil && res != nil {
+		for _, b := range res.Content {
+			fmt.Println(b.Text)
+		}
+	}
 
 	return nil
 }
@@ -389,13 +470,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	cwd, _ := os.Getwd()
 	cfg, _ := config.Load(config.ConfigPath(true))
-	globalPath := ""
-	if cfg != nil {
-		globalPath = cfg.GlobalPath
-	}
-	if globalPath == "" {
-		globalPath = config.DefaultGlobalPath()
-	}
+	globalPath := resolveGlobalPath(cfg)
 
 	handler := mcp.NewToolHandler(db, ".srcmap")
 	handler.Orchestrator = fetcher.NewOrchestrator(cwd, globalPath)
@@ -464,7 +539,10 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	cwd, _ := os.Getwd()
 	localCfg, _ := config.Load(config.ConfigPath(false))
-	globalPath := cfg.GlobalPath
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
 	if globalPath == "" && localCfg != nil {
 		globalPath = localCfg.GlobalPath
 	}
@@ -514,6 +592,7 @@ func runMCPInstall(cmd *cobra.Command, args []string) error {
 func runUpdate(cmd *cobra.Command, args []string) error {
 	all, _ := cmd.Flags().GetBool("all")
 	full, _ := cmd.Flags().GetBool("full")
+	refetch, _ := cmd.Flags().GetBool("refetch")
 
 	db, err := openDB()
 	if err != nil {
@@ -537,17 +616,50 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("specify a source name or use --all")
 	}
 
+	cfg, _ := config.Load(config.ConfigPath(false))
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
+	cwd, _ := os.Getwd()
+	orch := fetcher.NewOrchestrator(cwd, globalPath)
 	reg := parser.NewRegistry()
-	for _, src := range sources {
-		if src.Path == "" {
-			fmt.Fprintf(os.Stderr, "⚠ %s: no source path stored, skipping code re-index\n", src.Name)
-			continue
-		}
+	handler := mcp.NewToolHandler(db, ".srcmap")
+	ctx := context.Background()
 
+	for _, src := range sources {
 		if full {
-			fmt.Printf("Re-indexing %s (full)...\n", src.Name)
+			fmt.Printf("Updating %s (full re-index)...\n", src.Name)
 		} else {
 			fmt.Printf("Updating %s...\n", src.Name)
+		}
+
+		// Re-fetch (at latest) when requested, or when on-disk path is missing.
+		needsFetch := refetch || src.Path == ""
+		if !needsFetch {
+			if _, err := os.Stat(src.Path); err != nil {
+				needsFetch = true
+			}
+		}
+		if needsFetch {
+			req := fetcher.ParsePackageName(src.Name, src.Global)
+			results := orch.FetchAll(ctx, []fetcher.FetchRequest{req})
+			if len(results) == 0 || results[0].Err != nil {
+				errMsg := "unknown"
+				if len(results) > 0 && results[0].Err != nil {
+					errMsg = results[0].Err.Error()
+				}
+				fmt.Fprintf(os.Stderr, "⚠ %s: re-fetch failed: %s\n", src.Name, errMsg)
+				continue
+			}
+			r := results[0]
+			src.Version = r.Source.Version
+			src.RepoURL = r.Source.RepoURL
+			src.Path = r.Source.Path
+			fmt.Printf("  re-fetched @%s → %s\n", r.Source.Version, r.Source.Path)
 		}
 
 		symbols, err := reg.ParseDirectory(src.Path)
@@ -556,6 +668,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		if err := db.ClearSymbolsForSource(src.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ %s: could not clear old symbols: %v\n", src.Name, err)
+		}
 		indexed := 0
 		for i := range symbols {
 			symbols[i].SourceID = src.ID
@@ -565,14 +680,84 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			indexed++
 		}
 
-		now := time.Now().UTC().Format(time.RFC3339)
-		src.LastUpdated = now
-		db.InsertSource(&src)
+		src.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+		if err := db.InsertSource(&src); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ %s: could not persist source record: %v\n", src.Name, err)
+		}
+
+		// Re-ingest local docs (README, docs/) so the doc set reflects the
+		// freshly-cloned source.
+		if _, err := handler.AutoIngestLocalDocs(ctx, src.ID, src.Path); err != nil {
+			fmt.Fprintf(os.Stderr, "  docs: %v\n", err)
+		}
 
 		fmt.Printf("✓ %s: re-indexed %d symbols\n", src.Name, indexed)
 	}
 
 	return nil
+}
+
+func runOutdated(cmd *cobra.Command, args []string) error {
+	db, err := openDB()
+	if err != nil {
+		return fmt.Errorf("opening database: %w", err)
+	}
+	defer db.Close()
+
+	sources, err := db.ListSources(false)
+	if err != nil {
+		return fmt.Errorf("listing sources: %w", err)
+	}
+	if len(sources) == 0 {
+		fmt.Println("No sources indexed.")
+		return nil
+	}
+
+	cfg, _ := config.Load(config.ConfigPath(false))
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
+	cwd, _ := os.Getwd()
+	orch := fetcher.NewOrchestrator(cwd, globalPath)
+	ctx := context.Background()
+
+	outdated := 0
+	for _, src := range sources {
+		req := fetcher.ParsePackageName(src.Name, src.Global)
+		latest, _, err := orch.LatestVersion(ctx, req)
+		if err != nil {
+			fmt.Printf("%-30s local:%-12s upstream: error (%v)\n", src.Name, valueOrDash(src.Version), err)
+			continue
+		}
+		local := strings.TrimPrefix(src.Version, "v")
+		remote := strings.TrimPrefix(latest, "v")
+		status := "up to date"
+		if local != "" && remote != "" && local != remote {
+			status = "outdated → " + latest
+			outdated++
+		} else if local == "" && remote != "" {
+			status = "unknown → " + latest
+			outdated++
+		}
+		fmt.Printf("%-30s local:%-12s %s\n", src.Name, valueOrDash(src.Version), status)
+	}
+	if outdated == 0 {
+		fmt.Println("\nAll sources up to date.")
+	} else {
+		fmt.Printf("\n%d source(s) behind upstream. Run 'srcmap update <name> --refetch' or 'srcmap update --all --refetch'.\n", outdated)
+	}
+	return nil
+}
+
+func valueOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func runCheck(cmd *cobra.Command, args []string) error {
@@ -620,9 +805,16 @@ func runLink(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	globalPath := ""
+	if cfg != nil {
+		globalPath = cfg.GlobalPath
+	}
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
 
 	// Check global source exists
-	globalDBPath := filepath.Join(cfg.GlobalPath, "index.db")
+	globalDBPath := filepath.Join(globalPath, "index.db")
 	globalDB, err := index.Open(globalDBPath)
 	if err != nil {
 		return fmt.Errorf("opening global database: %w", err)

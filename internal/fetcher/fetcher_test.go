@@ -141,9 +141,9 @@ func TestLockfileVersionDetection(t *testing.T) {
 	testdataDir := filepath.Join("..", "..", "testdata")
 
 	tests := []struct {
-		name    string
-		pkg     string
-		want    string
+		name string
+		pkg  string
+		want string
 	}{
 		{"package-lock zod", "zod", "3.22.4"},
 		{"package-lock typescript", "typescript", "5.3.2"},

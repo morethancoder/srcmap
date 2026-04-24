@@ -68,6 +68,43 @@ func TestSymbolIndexWrite(t *testing.T) {
 	}
 }
 
+func TestClearSymbolsForSource(t *testing.T) {
+	db := openTestDB(t)
+
+	// Insert a second source so we can prove the clear is scoped.
+	if err := db.InsertSource(&index.SourceRecord{ID: "other", Name: "other"}); err != nil {
+		t.Fatalf("insert other: %v", err)
+	}
+	for _, s := range []*parser.Symbol{
+		{Name: "A", Kind: parser.SymbolMethod, FilePath: "x.ts", SourceID: "test-source"},
+		{Name: "B", Kind: parser.SymbolMethod, FilePath: "x.ts", SourceID: "test-source"},
+		{Name: "C", Kind: parser.SymbolMethod, FilePath: "y.ts", SourceID: "other"},
+	} {
+		if _, err := db.InsertSymbol(s); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	if err := db.ClearSymbolsForSource("test-source"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+
+	left, err := db.SearchSymbols("test-source", "")
+	if err != nil {
+		t.Fatalf("search test-source: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("expected 0 test-source symbols after clear, got %d", len(left))
+	}
+	other, err := db.SearchSymbols("other", "")
+	if err != nil {
+		t.Fatalf("search other: %v", err)
+	}
+	if len(other) != 1 {
+		t.Errorf("clear leaked across sources: other has %d symbols, want 1", len(other))
+	}
+}
+
 func TestSearchSymbols(t *testing.T) {
 	db := openTestDB(t)
 

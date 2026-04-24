@@ -7,15 +7,15 @@ import (
 
 // CostTracker tracks token usage and cost across a session.
 type CostTracker struct {
-	mu             sync.Mutex
-	inputPrice     float64 // price per 1M input tokens
-	outputPrice    float64 // price per 1M output tokens
-	sessionInput   int
-	sessionOutput  int
-	sessionCost    float64
-	lastInput      int
-	lastOutput     int
-	lastCost       float64
+	mu            sync.Mutex
+	inputPrice    float64 // price per 1M input tokens
+	outputPrice   float64 // price per 1M output tokens
+	sessionInput  int
+	sessionOutput int
+	sessionCost   float64
+	lastInput     int
+	lastOutput    int
+	lastCost      float64
 }
 
 // NewCostTracker creates a cost tracker with the given per-1M-token prices.

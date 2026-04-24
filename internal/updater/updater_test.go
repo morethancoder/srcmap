@@ -31,9 +31,9 @@ func TestFingerprintChanged(t *testing.T) {
 	store.Set("file3.ts", "ghi789")
 
 	current := map[string]string{
-		"file1.ts": "abc123",  // unchanged
-		"file2.ts": "xyz999",  // changed
-		"file4.ts": "new111",  // new
+		"file1.ts": "abc123", // unchanged
+		"file2.ts": "xyz999", // changed
+		"file4.ts": "new111", // new
 		// file3.ts removed
 	}
 

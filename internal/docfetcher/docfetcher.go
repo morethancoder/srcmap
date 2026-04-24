@@ -41,7 +41,19 @@ type Chunk struct {
 	EstimatedTokens int
 	Fingerprint     string
 	Status          ChunkStatus
+	Kind            ChunkKind // semantic class: doc|changelog|schema|nav
+	AnchorID        string    // HTML id anchor if chunk maps to a single named entity
 }
+
+// ChunkKind is the semantic class of a chunk, used to weight/filter search.
+type ChunkKind string
+
+const (
+	ChunkKindDoc       ChunkKind = "doc"
+	ChunkKindChangelog ChunkKind = "changelog"
+	ChunkKindSchema    ChunkKind = "schema"
+	ChunkKindNav       ChunkKind = "nav"
+)
 
 // ChunkStatus tracks the processing state of a chunk.
 type ChunkStatus string

@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/morethancoder/srcmap/internal/httpx"
+	"github.com/morethancoder/srcmap/internal/logging"
 )
 
 // DiscoveryService handles LLM-powered doc source discovery.
@@ -18,7 +21,7 @@ type DiscoveryService struct {
 // NewDiscoveryService creates a new discovery service.
 func NewDiscoveryService() *DiscoveryService {
 	return &DiscoveryService{
-		Client: &http.Client{Timeout: 5 * time.Second},
+		Client: httpx.NewClient(10 * time.Second),
 	}
 }
 
@@ -42,7 +45,8 @@ func (d *DiscoveryService) ValidateAndClassify(ctx context.Context, url, fallbac
 		}, nil
 	}
 
-	// Validate URL with HEAD request
+	t := logging.Stage("doc.discover", "url", url)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating HEAD request: %w", err)
@@ -50,6 +54,12 @@ func (d *DiscoveryService) ValidateAndClassify(ctx context.Context, url, fallbac
 
 	resp, err := d.Client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			resp.Body.Close()
+		}
+		t.Warn(err, "unvalidated", "url", url, "status", status)
 		return &DiscoveryResult{
 			Found:       false,
 			URL:         url,
@@ -58,8 +68,10 @@ func (d *DiscoveryService) ValidateAndClassify(ctx context.Context, url, fallbac
 			FallbackURL: fallbackURL,
 		}, nil
 	}
+	defer resp.Body.Close()
 
 	contentType := classifyURL(url, resp.Header.Get("Content-Type"))
+	t.Done("url", url, "content_type", string(contentType))
 
 	return &DiscoveryResult{
 		Found:       true,

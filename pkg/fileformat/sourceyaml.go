@@ -10,13 +10,13 @@ import (
 
 // SourceYAML represents the source.yaml file for a documentation source.
 type SourceYAML struct {
-	Name        string       `yaml:"name"`
-	Description string       `yaml:"description,omitempty"`
-	Version     string       `yaml:"version,omitempty"`
-	DocOrigin   *DocOrigin   `yaml:"doc_origin,omitempty"`
+	Name        string        `yaml:"name"`
+	Description string        `yaml:"description,omitempty"`
+	Version     string        `yaml:"version,omitempty"`
+	DocOrigin   *DocOrigin    `yaml:"doc_origin,omitempty"`
 	Update      *UpdateConfig `yaml:"update,omitempty"`
-	Triggers    []string     `yaml:"triggers,omitempty"`
-	Stats       SourceStats  `yaml:"stats"`
+	Triggers    []string      `yaml:"triggers,omitempty"`
+	Stats       SourceStats   `yaml:"stats"`
 }
 
 // DocOrigin records how documentation was discovered and fetched.

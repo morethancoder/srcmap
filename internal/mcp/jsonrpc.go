@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -31,6 +32,14 @@ type JSONRPCError struct {
 	Message string `json:"message"`
 }
 
+// report/reportN are kept as no-op stubs so tool handlers can continue
+// calling them without cluttering call sites. Progress notifications were
+// removed because the MCP TypeScript client (used by Claude Code) drops
+// the transport when it sees a progress notification whose token it no
+// longer tracks — and our emissions race against response delivery.
+func report(context.Context, string)                    {}
+func reportN(context.Context, float64, float64, string) {}
+
 // StdioServer implements the MCP protocol over stdin/stdout.
 type StdioServer struct {
 	handler *ToolHandler
@@ -51,8 +60,8 @@ func NewStdioServer(handler *ToolHandler, r io.Reader, w io.Writer) *StdioServer
 // Serve runs the server loop, reading JSON-RPC requests and writing responses.
 func (s *StdioServer) Serve(ctx context.Context) error {
 	scanner := bufio.NewScanner(s.reader)
-	// Increase buffer size for large messages
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	const maxMessage = 16 * 1024 * 1024
+	scanner.Buffer(make([]byte, 0, 64*1024), maxMessage)
 
 	for scanner.Scan() {
 		select {
@@ -72,7 +81,7 @@ func (s *StdioServer) Serve(ctx context.Context) error {
 			continue
 		}
 
-		resp := s.handleRequest(ctx, &req)
+		resp := s.safeHandle(ctx, &req)
 		if resp != nil {
 			s.writeResponse(resp)
 		}
@@ -81,31 +90,76 @@ func (s *StdioServer) Serve(ctx context.Context) error {
 	return scanner.Err()
 }
 
+// safeHandle wraps handleRequest with panic recovery so a buggy tool
+// doesn't tear down the stdio server.
+func (s *StdioServer) safeHandle(ctx context.Context, req *JSONRPCRequest) (resp *JSONRPCResponse) {
+	defer func() {
+		if r := recover(); r != nil {
+			if len(req.ID) == 0 || string(req.ID) == "null" {
+				resp = nil
+				return
+			}
+			resp = &JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error:   &JSONRPCError{Code: -32603, Message: fmt.Sprintf("internal error: %v", r)},
+			}
+		}
+	}()
+	return s.handleRequest(ctx, req)
+}
+
 func (s *StdioServer) handleRequest(ctx context.Context, req *JSONRPCRequest) *JSONRPCResponse {
+	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
+
 	switch req.Method {
 	case "initialize":
 		return s.handleInitialize(req)
-	case "initialized":
-		return nil // notification, no response
 	case "tools/list":
 		return s.handleToolsList(req)
 	case "tools/call":
 		return s.handleToolsCall(ctx, req)
-	default:
-		return &JSONRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error:   &JSONRPCError{Code: -32601, Message: fmt.Sprintf("method not found: %s", req.Method)},
-		}
+	case "ping":
+		return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]interface{}{}}
+	}
+
+	if isNotification || strings.HasPrefix(req.Method, "notifications/") {
+		return nil
+	}
+
+	return &JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Error:   &JSONRPCError{Code: -32601, Message: fmt.Sprintf("method not found: %s", req.Method)},
 	}
 }
 
+// initializeParams captures the client's requested protocol version so the
+// server can echo it back when compatible.
+type initializeParams struct {
+	ProtocolVersion string `json:"protocolVersion"`
+}
+
+// supportedProtocolVersions lists MCP versions this server can speak, newest first.
+var supportedProtocolVersions = []string{"2025-03-26", "2024-11-05"}
+
 func (s *StdioServer) handleInitialize(req *JSONRPCRequest) *JSONRPCResponse {
+	var params initializeParams
+	_ = json.Unmarshal(req.Params, &params)
+
+	version := supportedProtocolVersions[len(supportedProtocolVersions)-1]
+	for _, v := range supportedProtocolVersions {
+		if v == params.ProtocolVersion {
+			version = v
+			break
+		}
+	}
+
 	return &JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result: map[string]interface{}{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": version,
 			"capabilities": map[string]interface{}{
 				"tools": map[string]interface{}{},
 			},

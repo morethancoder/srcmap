@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,59 +43,112 @@ func NewToolHandler(db *index.DB, srcmapDir string) *ToolHandler {
 }
 
 // AllTools returns definitions for all MCP tools.
+//
+// Tool descriptions follow a strict convention so calling agents can pick the
+// right tool without reading the code:
+//
+//  1. First line is a one-sentence summary of WHAT the tool does.
+//  2. Second line (when helpful) says WHEN to use it — and names the tool to
+//     try first if this isn't the right one.
+//  3. Descriptions mention the parameter spelling the agent actually needs
+//     (e.g. "source ID such as 'zod' — lowercase"), not just the name.
 func (h *ToolHandler) AllTools() []Tool {
+	sourceProp := map[string]string{"type": "string", "description": "Source ID (e.g. 'zod', 'flask', 'gin') as reported by srcmap_list_sources."}
+
 	tools := []Tool{
 		{
-			Name:        "srcmap_lookup",
-			Description: "Look up a specific code symbol by source and name. Returns file path, line range, parameters, and return type.",
+			Name: "srcmap_list_sources",
+			Description: "List every indexed source with its version, scope, symbol and section counts. " +
+				"Start here whenever you are unsure what is available.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID (e.g. 'zod')"},
-					"symbol": map[string]string{"type": "string", "description": "Symbol name (e.g. 'ZodString.min')"},
+					"global_only": map[string]interface{}{"type": "boolean", "description": "If true, only list sources from the user's global ~/.srcmap/ scope. Default false."},
 				},
-				"required": []string{"source", "symbol"},
 			},
 		},
 		{
-			Name:        "srcmap_search_code",
-			Description: "Search code symbols by name pattern within a source.",
+			Name: "srcmap_source_info",
+			Description: "Return metadata for one source: version, last_updated, symbol/section/concept/gotcha counts, and doc-chunk processing status. " +
+				"Use this to confirm a source is ready before querying it.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"source": sourceProp},
+				"required":   []string{"source"},
+			},
+		},
+		{
+			Name: "srcmap_find",
+			Description: "Unified fast lookup — ALWAYS PREFER THIS when you are not certain the name is exact. " +
+				"Tries exact symbol / doc-file name match first, then FTS5 ranked search across all chunks with BM25 snippets. " +
+				"Falls back to srcmap_lookup / srcmap_doc_search when you already know the exact identifier.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-					"query":  map[string]string{"type": "string", "description": "Search query (name pattern)"},
+					"source": sourceProp,
+					"query":  map[string]string{"type": "string", "description": "Name, phrase, or keyword. Camel/snake-case both work."},
+					"limit":  map[string]interface{}{"type": "number", "description": "Max ranked results. Default 10."},
 				},
 				"required": []string{"source", "query"},
 			},
 		},
 		{
-			Name:        "srcmap_doc_map",
-			Description: "Return the root index.md for a source, showing all sections and their descriptions. If no map exists, the response tells you to call srcmap_write_map to create one.",
+			Name: "srcmap_lookup",
+			Description: "Exact-name lookup of a code symbol (function / method / type / constant). " +
+				"Returns file path, line range, parameters, and return type. " +
+				"If you don't know the exact name, use srcmap_find instead.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
+					"source": sourceProp,
+					"symbol": map[string]string{"type": "string", "description": "Exact symbol name (e.g. 'ZodString.min', 'bot.SendMessage')."},
 				},
-				"required": []string{"source"},
+				"required": []string{"source", "symbol"},
 			},
 		},
 		{
-			Name:        "srcmap_write_map",
-			Description: "Create or overwrite the root index.md for a source. Use this AFTER srcmap_fetch or srcmap_docs_add so future agents can navigate map → section → method/concept. Provide a short curated description per section instead of letting the auto-generated 'Documentation for X' stubs stand. Any existing <!-- custom --> blocks in index.md are preserved.",
+			Name: "srcmap_search_code",
+			Description: "Substring search over parsed code symbols by name (SQL LIKE '%query%'). " +
+				"Use this to enumerate candidates by naming pattern; use srcmap_find for semantic search over docs.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source":   map[string]string{"type": "string", "description": "Source ID (e.g. 'zod') as reported by srcmap_list_sources."},
-					"overview": map[string]string{"type": "string", "description": "Optional 1-3 sentence overview of what this source is and when to use it."},
+					"source": sourceProp,
+					"query":  map[string]string{"type": "string", "description": "Substring of the symbol name."},
+				},
+				"required": []string{"source", "query"},
+			},
+		},
+		{
+			Name: "srcmap_doc_map",
+			Description: "Return the root index.md for a source: a top-level map of every documentation section. " +
+				"Call this first when exploring a newly-added source to decide which section to drill into. " +
+				"If no map exists, the response tells you to call srcmap_write_map to create one.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"source": sourceProp},
+				"required":   []string{"source"},
+			},
+		},
+		{
+			Name: "srcmap_write_map",
+			Description: "Create or overwrite the root index.md for a source. " +
+				"Use this AFTER srcmap_fetch or srcmap_docs_add so future agents can navigate via map → section → method/concept → file. " +
+				"Provide a short curated description per section instead of letting the auto-generated \"Documentation for X\" stubs stand. " +
+				"Pass the same `source` you saw in srcmap_list_sources. Any existing <!-- custom --> blocks in the current index.md are preserved.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"source":   sourceProp,
+					"overview": map[string]string{"type": "string", "description": "Optional 1-3 sentence overview of what this source is and when to use it. Rendered above the section list."},
 					"sections": map[string]interface{}{
 						"type":        "array",
-						"description": "Ordered list of sections to show in the map.",
+						"description": "Ordered list of sections to show in the map. Each entry becomes a `- **[name](name/section.md)** — description` line.",
 						"items": map[string]interface{}{
 							"type": "object",
 							"properties": map[string]interface{}{
-								"name":        map[string]string{"type": "string", "description": "Section name — should match an existing directory under .srcmap/docs/<source>/."},
-								"description": map[string]string{"type": "string", "description": "One-line description of what's in this section."},
+								"name":        map[string]string{"type": "string", "description": "Section name — MUST match an existing directory under .srcmap/docs/<source>/, or the link will dead-end."},
+								"description": map[string]string{"type": "string", "description": "One-line description of what's in this section. Think 'what would let an agent decide whether to drill in?'."},
 							},
 							"required": []string{"name", "description"},
 						},
@@ -105,159 +159,177 @@ func (h *ToolHandler) AllTools() []Tool {
 		},
 		{
 			Name:        "srcmap_doc_section",
-			Description: "Return a section.md showing all methods and their one-line summaries.",
+			Description: "Return a section's section.md — a listing of every method and concept within that section, with one-line summaries.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source":  map[string]string{"type": "string", "description": "Source ID"},
-					"section": map[string]string{"type": "string", "description": "Section name"},
+					"source":  sourceProp,
+					"section": map[string]string{"type": "string", "description": "Section name as shown by srcmap_doc_map (case-insensitive)."},
 				},
 				"required": []string{"source", "section"},
 			},
 		},
 		{
 			Name:        "srcmap_doc_lookup",
-			Description: "Return the full content of a method.md doc file.",
+			Description: "Return the full method.md doc body for one named method — use after srcmap_doc_section or srcmap_find surfaces the method name.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-					"method": map[string]string{"type": "string", "description": "Method name"},
+					"source": sourceProp,
+					"method": map[string]string{"type": "string", "description": "Method name (case-insensitive). Matches the file name under <section>/methods/."},
 				},
 				"required": []string{"source", "method"},
 			},
 		},
 		{
 			Name:        "srcmap_doc_concept",
-			Description: "Return the full content of a concept.md doc file.",
+			Description: "Return the full concept.md doc body for one named concept (non-callable topic like 'Middleware', 'Auth', 'Streaming').",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source":  map[string]string{"type": "string", "description": "Source ID"},
-					"concept": map[string]string{"type": "string", "description": "Concept name"},
+					"source":  sourceProp,
+					"concept": map[string]string{"type": "string", "description": "Concept name (case-insensitive)."},
 				},
 				"required": []string{"source", "concept"},
 			},
 		},
 		{
-			Name:        "srcmap_doc_search",
-			Description: "Fuzzy search across all doc files for a source.",
+			Name: "srcmap_doc_search",
+			Description: "FTS5 ranked search across all doc chunks for a source — returns highlighted BM25 snippets. " +
+				"Prefer srcmap_find unless you specifically want doc-only hits (no symbols).",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-					"query":  map[string]string{"type": "string", "description": "Search query"},
+					"source": sourceProp,
+					"query":  map[string]string{"type": "string", "description": "Search query — supports multi-word phrases."},
+					"limit":  map[string]interface{}{"type": "number", "description": "Max results. Default 10."},
 				},
 				"required": []string{"source", "query"},
 			},
 		},
 		{
-			Name:        "srcmap_doc_gotchas",
-			Description: "Return relevant gotchas for a source, optionally filtered by method.",
+			Name: "srcmap_doc_gotchas",
+			Description: "Return the gotchas.md file for a source — known footguns, breaking changes, common pitfalls. " +
+				"Consult this before suggesting non-trivial code that uses a library.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-					"method": map[string]string{"type": "string", "description": "Optional method name to filter gotchas"},
+					"source": sourceProp,
+					"method": map[string]string{"type": "string", "description": "Optional method filter (currently informational)."},
 				},
 				"required": []string{"source"},
 			},
 		},
 		{
-			Name:        "srcmap_source_info",
-			Description: "Return source metadata: name, version, last_updated, triggers, stats.",
+			Name: "srcmap_process_chunk",
+			Description: "Process one pending doc chunk by ID — auto-classifies it and writes its doc file. " +
+				"Used only for fine-grained control; prefer srcmap_process_all for the normal case.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-				},
-				"required": []string{"source"},
-			},
-		},
-		{
-			Name:        "srcmap_process_chunk",
-			Description: "Process one pre-chunked text block. Fetches the chunk from the database, auto-classifies it, and writes the doc file. No content input needed — the tool handles everything.",
-			InputSchema: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"chunk_id": map[string]string{"type": "number", "description": "Chunk ID from the database"},
+					"chunk_id": map[string]string{"type": "number", "description": "Chunk ID (returned by the database, shown in srcmap_process_status when --verbose)."},
 				},
 				"required": []string{"chunk_id"},
 			},
 		},
 		{
-			Name:        "srcmap_process_all",
-			Description: "Process ALL pending doc chunks for a source in one call. Auto-classifies each chunk, writes doc files, builds index and section files, and updates source counts. Use this after srcmap_docs_add.",
+			Name: "srcmap_process_all",
+			Description: "Process every pending doc chunk for a source in a single call: classify, write method/concept/gotcha files, rebuild the index and section listings, and update counts. " +
+				"srcmap_docs_add already calls this automatically — you only need it if a previous run was interrupted.",
 			InputSchema: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
-				},
-				"required": []string{"source"},
+				"type":       "object",
+				"properties": map[string]interface{}{"source": sourceProp},
+				"required":   []string{"source"},
 			},
 		},
 		{
 			Name:        "srcmap_process_status",
-			Description: "Return pending/processed/failed chunk counts for a source.",
+			Description: "Return the pending / processed / failed chunk counts for a source — use this to verify doc ingestion finished.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"source": sourceProp},
+				"required":   []string{"source"},
+			},
+		},
+		{
+			Name: "srcmap_delete_source",
+			Description: "Permanently delete a source from the database AND remove its .srcmap/docs/<source>/ directory. " +
+				"Irreversible — only use when the user explicitly asks to remove a source.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
-					"source": map[string]string{"type": "string", "description": "Source ID"},
+					"source": map[string]string{"type": "string", "description": "Source ID to delete."},
 				},
 				"required": []string{"source"},
 			},
 		},
-		{
-			Name:        "srcmap_list_sources",
-			Description: "List all indexed sources with their version, symbol count, doc stats, and scope (local or global).",
-			InputSchema: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"global_only": map[string]interface{}{"type": "boolean", "description": "If true, only list global sources. Default: false (list all)."},
-				},
-			},
-		},
 	}
 
-	// Add fetch/docs-add tools only when orchestrator is configured (agent mode).
+	// Fetch/docs-add/update tools are exposed only when the orchestrator is
+	// wired up (i.e. we are running `srcmap mcp` from a project directory).
 	if h.Orchestrator != nil {
 		tools = append(tools,
 			Tool{
-				Name:        "srcmap_fetch",
-				Description: "Fetch and index a package's source code. Supports npm packages, pypi:package, Go modules (github.com/...), and GitHub repos (owner/repo). After fetching, symbols are parsed and indexed automatically.",
+				Name: "srcmap_fetch",
+				Description: "Clone a package's source, parse its symbols, and auto-ingest local docs (README, docs/). " +
+					"First step for any new source. Accepts npm names ('zod'), pypi ('pypi:flask'), Go modules ('github.com/gin-gonic/gin'), or GitHub shorthand ('owner/repo'). " +
+					"After fetching, call srcmap_docs_add with an official docs URL for best-quality doc coverage.",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"packages": map[string]interface{}{
 							"type":        "array",
 							"items":       map[string]string{"type": "string"},
-							"description": "Package names to fetch (e.g. ['zod', 'pypi:flask', 'github.com/gin-gonic/gin'])",
+							"description": "Package identifiers to fetch. Examples: ['zod'], ['pypi:flask'], ['github.com/gin-gonic/gin'], ['owner/repo'].",
 						},
+						"global": map[string]interface{}{"type": "boolean", "description": "If true, store in the user's global ~/.srcmap/ scope so other projects can reuse this source."},
 					},
 					"required": []string{"packages"},
 				},
 			},
 			Tool{
-				Name:        "srcmap_docs_add",
-				Description: "Add documentation for a source by fetching from a URL. Automatically crawls the URL, chunks the content, classifies each chunk, writes structured doc files, and builds the index. Everything happens in one call — no manual processing needed.",
+				Name: "srcmap_docs_add",
+				Description: "Ingest documentation for a source in one call. Auto-detects whether the URL is llms.txt / llms-full.txt, a plain markdown file, an OpenAPI spec, or an HTML site (in which case it crawls sub-pages up to depth 2). Chunks, stores, processes, and writes the full doc hierarchy. " +
+					"The source must already exist (typically from srcmap_fetch). If you don't know the best URL, ask the user or search for llms.txt / llms-full.txt / /docs first.",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"source": map[string]string{"type": "string", "description": "Source name (must match an existing source or will be created)"},
-						"url":    map[string]string{"type": "string", "description": "URL to fetch documentation from (markdown, HTML, or raw text)"},
+						"source": map[string]string{"type": "string", "description": "Source ID. Must match the name used with srcmap_fetch."},
+						"url":    map[string]string{"type": "string", "description": "Root docs URL. Prefer llms.txt / llms-full.txt / docs.md when available."},
 					},
 					"required": []string{"source", "url"},
 				},
 			},
 			Tool{
-				Name:        "srcmap_ingest_local_docs",
-				Description: "Offline fallback — ingest docs from the cloned source's own README and docs/ folder. Use only when no web docs URL is available. Source must already be fetched.",
+				Name: "srcmap_ingest_local_docs",
+				Description: "Offline fallback: ingest docs only from the source's own README.md and docs/ folder. " +
+					"Use when no upstream docs URL is available or the network is unreachable. srcmap_fetch calls this automatically on every fetch, so you usually don't need to call it yourself.",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{"source": sourceProp},
+					"required":   []string{"source"},
+				},
+			},
+			Tool{
+				Name: "srcmap_update_source",
+				Description: "Update one already-indexed source: re-clone at the latest upstream version, re-parse symbols, and re-ingest local docs. " +
+					"Use this when the user says 'update source X', 'refresh X', or 'pull latest X'. Combines srcmap_outdated → re-fetch → re-index in a single call.",
 				InputSchema: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"source": map[string]string{"type": "string", "description": "Source ID (must be already fetched)"},
+						"source":  sourceProp,
+						"refetch": map[string]interface{}{"type": "boolean", "description": "If true (default), always re-clone from upstream. If false, only re-parse what is already on disk."},
 					},
 					"required": []string{"source"},
+				},
+			},
+			Tool{
+				Name: "srcmap_outdated",
+				Description: "Check every indexed source against its upstream registry (npm / pypi / go proxy / git) and report which local versions are behind. Does NOT modify anything. " +
+					"Use this when the user asks 'what's out of date?' or 'check for updates'. Follow up with srcmap_update_source to apply updates.",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
 				},
 			},
 		)
@@ -296,6 +368,8 @@ func (h *ToolHandler) dispatchTool(ctx context.Context, name string, args map[st
 		return h.handleDocConcept(args)
 	case "srcmap_doc_search":
 		return h.handleDocSearch(args)
+	case "srcmap_find":
+		return h.handleFind(args)
 	case "srcmap_doc_gotchas":
 		return h.handleDocGotchas(args)
 	case "srcmap_source_info":
@@ -303,7 +377,7 @@ func (h *ToolHandler) dispatchTool(ctx context.Context, name string, args map[st
 	case "srcmap_process_chunk":
 		return h.handleProcessChunk(args)
 	case "srcmap_process_all":
-		return h.handleProcessAll(args)
+		return h.handleProcessAll(ctx, args)
 	case "srcmap_process_status":
 		return h.handleProcessStatus(args)
 	case "srcmap_fetch":
@@ -314,6 +388,12 @@ func (h *ToolHandler) dispatchTool(ctx context.Context, name string, args map[st
 		return h.handleIngestLocalDocs(ctx, args)
 	case "srcmap_list_sources":
 		return h.handleListSources(args)
+	case "srcmap_delete_source":
+		return h.handleDeleteSource(args)
+	case "srcmap_update_source":
+		return h.handleUpdateSource(ctx, args)
+	case "srcmap_outdated":
+		return h.handleOutdated(ctx, args)
 	default:
 		return &ToolResult{
 			Content: []ContentBlock{{Type: "text", Text: fmt.Sprintf("unknown tool: %s", name)}},
@@ -362,10 +442,11 @@ func (h *ToolHandler) handleSearchCode(args map[string]interface{}) (*ToolResult
 
 func (h *ToolHandler) handleDocMap(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
-	if source == "" {
-		return textError("source is required"), nil
+	dir, err := h.safeSourceDir(source)
+	if err != nil {
+		return textError(err.Error()), nil
 	}
-	path := filepath.Join(h.SrcmapDir, "docs", source, "index.md")
+	path := filepath.Join(dir, "index.md")
 	if _, err := os.Stat(path); err != nil {
 		h.rebuildIndexFiles(source)
 	}
@@ -394,15 +475,19 @@ func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, 
 	if source == "" {
 		return textError("source is required"), nil
 	}
+	if _, err := h.safeSourceDir(source); err != nil {
+		return textError(err.Error()), nil
+	}
+
 	overview, _ := args["overview"].(string)
 	rawSections, _ := args["sections"].([]interface{})
 	if len(rawSections) == 0 {
 		return textError("sections is required and must be a non-empty array"), nil
 	}
 
-	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
 	var summaries []fileformat.SectionSummary
 	var skipped []string
+	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
 	for _, raw := range rawSections {
 		obj, ok := raw.(map[string]interface{})
 		if !ok {
@@ -413,9 +498,9 @@ func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, 
 		if name == "" || desc == "" {
 			continue
 		}
-		// Warn the agent about sections without a matching on-disk directory,
-		// but still include them so the agent can pre-author sections it
-		// plans to create.
+		// Warn the agent about sections that don't exist on disk — the link
+		// would dead-end — but still write them so the agent can hand-author
+		// sections it plans to create.
 		if _, err := os.Stat(filepath.Join(docsDir, sanitizeSection(name))); err != nil {
 			skipped = append(skipped, name)
 		}
@@ -425,7 +510,7 @@ func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, 
 		})
 	}
 	if len(summaries) == 0 {
-		return textError("no valid section entries provided (each needs a non-empty name and description)"), nil
+		return textError("no valid section entries provided (need name + description)"), nil
 	}
 
 	hb := fileformat.NewHierarchyBuilder(h.SrcmapDir, source)
@@ -433,13 +518,15 @@ func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, 
 		return textError(fmt.Sprintf("ensuring docs dir: %v", err)), nil
 	}
 
-	// Persist the overview in a <!-- custom --> block so subsequent auto
-	// rebuilds of index.md don't wipe it.
+	// Merge overview into a <!-- custom --> block if provided, so subsequent
+	// auto-rebuilds of index.md don't wipe it.
 	if strings.TrimSpace(overview) != "" {
 		indexPath := filepath.Join(docsDir, "index.md")
 		existing, _ := os.ReadFile(indexPath)
+		overviewBlock := "<!-- custom -->\n## Overview\n\n" + strings.TrimSpace(overview) + "\n<!-- /custom -->\n"
 		if !strings.Contains(string(existing), "<!-- custom -->") {
-			overviewBlock := "<!-- custom -->\n## Overview\n\n" + strings.TrimSpace(overview) + "\n<!-- /custom -->\n"
+			// First time: write a minimal index with just the overview so
+			// WriteIndex's subsequent run picks it up as a custom block.
 			_ = os.WriteFile(indexPath, []byte(overviewBlock), 0o644)
 		}
 	}
@@ -452,17 +539,22 @@ func (h *ToolHandler) handleWriteMap(args map[string]interface{}) (*ToolResult, 
 	if len(skipped) > 0 {
 		msg += fmt.Sprintf("\n\nWarning: these section names have no matching directory and their links will 404 until you create them:\n  - %s", strings.Join(skipped, "\n  - "))
 	}
-	msg += fmt.Sprintf("\n\nNext: call srcmap_doc_map(source=%q) to verify, then srcmap_doc_section on each section.", source)
+	msg += "\n\nNext: call srcmap_doc_map(source=\"" + source + "\") to verify, then srcmap_doc_section on each section."
 	return &ToolResult{Content: []ContentBlock{{Type: "text", Text: msg}}}, nil
 }
 
 func (h *ToolHandler) handleDocSection(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
 	section, _ := args["section"].(string)
-	path := filepath.Join(h.SrcmapDir, "docs", source, section, "section.md")
-	if _, err := os.Stat(path); err != nil {
-		path = filepath.Join(h.SrcmapDir, "docs", source, sanitizeSection(section), "section.md")
+	dir, err := h.safeSourceDir(source)
+	if err != nil {
+		return textError(err.Error()), nil
 	}
+	secSan := sanitizeSection(section)
+	if secSan == "" {
+		return textError("section is required"), nil
+	}
+	path := filepath.Join(dir, secSan, "section.md")
 	if _, err := os.Stat(path); err != nil {
 		h.rebuildIndexFiles(source)
 	}
@@ -520,35 +612,165 @@ func (h *ToolHandler) handleDocConcept(args map[string]interface{}) (*ToolResult
 func (h *ToolHandler) handleDocSearch(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
 	query, _ := args["query"].(string)
-	query = strings.ToLower(query)
+	limit := parseLimit(args["limit"], 10)
 
+	if source == "" || query == "" {
+		return textError("source and query are required"), nil
+	}
+
+	fts := ftsQuery(query)
+	var matches []index.DocMatch
+	if fts != "" {
+		var err error
+		matches, err = h.DB.SearchDocs(source, fts, limit)
+		if err != nil {
+			return textError(fmt.Sprintf("search failed: %v", err)), nil
+		}
+	}
+	if len(matches) > 0 {
+		var lines []string
+		for i, m := range matches {
+			title := m.Heading
+			if title == "" {
+				title = fmt.Sprintf("chunk-%d", m.ChunkID)
+			}
+			lines = append(lines, fmt.Sprintf("%d. %s  (rank %.2f)", i+1, title, m.Rank))
+			lines = append(lines, "   "+singleLine(m.Snippet))
+		}
+		return textResult(strings.Join(lines, "\n")), nil
+	}
+
+	// FTS empty — fall back to a file walk so doc files written outside the
+	// chunk pipeline (CHANGELOG, hand-authored custom blocks, tests) remain
+	// discoverable.
+	if files := h.grepDocFiles(source, query, limit); len(files) > 0 {
+		return textResult(strings.Join(files, "\n")), nil
+	}
+	return textResult(fmt.Sprintf("No matches for %q in %q.", query, source)), nil
+}
+
+func (h *ToolHandler) grepDocFiles(source, query string, limit int) []string {
 	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
-	var matches []string
-
+	needle := strings.ToLower(query)
+	var hits []string
 	filepath.Walk(docsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || filepath.Ext(path) != ".md" {
 			return nil
 		}
-		content, err := os.ReadFile(path)
+		if len(hits) >= limit {
+			return filepath.SkipAll
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
-		if strings.Contains(strings.ToLower(string(content)), query) {
+		if strings.Contains(strings.ToLower(string(data)), needle) {
 			rel, _ := filepath.Rel(docsDir, path)
-			matches = append(matches, rel)
+			hits = append(hits, rel)
 		}
 		return nil
 	})
+	return hits
+}
 
-	if len(matches) == 0 {
-		return textResult("No matching doc files found."), nil
+// ftsQuery wraps a freeform user query in FTS5 syntax. Terms are quoted so
+// camelCase / punctuation tokens work unchanged. Returns "" when the input
+// has no usable tokens — callers must skip FTS in that case.
+func ftsQuery(raw string) string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return ""
 	}
-	return textResult(strings.Join(matches, "\n")), nil
+	for i, f := range fields {
+		fields[i] = `"` + strings.ReplaceAll(f, `"`, `""`) + `"`
+	}
+	return strings.Join(fields, " ")
+}
+
+func singleLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	return truncate(s, 240)
+}
+
+func parseLimit(v interface{}, def int) int {
+	if f, ok := v.(float64); ok && f > 0 {
+		return int(f)
+	}
+	return def
+}
+
+// handleFind is the unified, fast lookup: tries exact symbol/method/concept
+// name matches first, then falls back to FTS5 ranked search with snippets.
+func (h *ToolHandler) handleFind(args map[string]interface{}) (*ToolResult, error) {
+	source, _ := args["source"].(string)
+	query, _ := args["query"].(string)
+	limit := parseLimit(args["limit"], 10)
+
+	if source == "" || query == "" {
+		return textError("source and query are required"), nil
+	}
+
+	var out []string
+
+	if sym, err := h.DB.LookupSymbol(source, query); err == nil && sym != nil {
+		out = append(out, fmt.Sprintf("✓ symbol %s (%s) — %s:%d-%d", sym.Name, sym.Kind, sym.FilePath, sym.StartLine, sym.EndLine))
+	}
+
+	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
+	target := sanitizeSection(query)
+	if target != "" {
+		filepath.Walk(docsDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || filepath.Ext(path) != ".md" {
+				return nil
+			}
+			if len(out) >= limit {
+				return filepath.SkipAll
+			}
+			base := strings.TrimSuffix(info.Name(), ".md")
+			if base == target {
+				rel, _ := filepath.Rel(h.SrcmapDir, path)
+				out = append(out, fmt.Sprintf("✓ doc file .srcmap/%s", rel))
+			}
+			return nil
+		})
+	}
+
+	fts := ftsQuery(query)
+	var matches []index.DocMatch
+	if fts != "" {
+		var err error
+		matches, err = h.DB.SearchDocs(source, fts, limit)
+		if err != nil {
+			return textError(fmt.Sprintf("fts search failed: %v", err)), nil
+		}
+	}
+
+	if len(out) == 0 && len(matches) == 0 {
+		return textResult(fmt.Sprintf("No hits for %q in %q.", query, source)), nil
+	}
+
+	if len(matches) > 0 {
+		out = append(out, "", fmt.Sprintf("Top %d ranked matches:", len(matches)))
+		for i, m := range matches {
+			title := m.Heading
+			if title == "" {
+				title = fmt.Sprintf("chunk-%d", m.ChunkID)
+			}
+			out = append(out, fmt.Sprintf("%d. %s  (rank %.2f)", i+1, title, m.Rank))
+			out = append(out, "   "+singleLine(m.Snippet))
+		}
+	}
+	return textResult(strings.Join(out, "\n")), nil
 }
 
 func (h *ToolHandler) handleDocGotchas(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
-	path := filepath.Join(h.SrcmapDir, "docs", source, "gotchas.md")
+	dir, err := h.safeSourceDir(source)
+	if err != nil {
+		return textError(err.Error()), nil
+	}
+	path := filepath.Join(dir, "gotchas.md")
 	if _, err := os.Stat(path); err != nil {
 		h.ensureGotchasFile(source)
 	}
@@ -600,18 +822,21 @@ func (h *ToolHandler) handleProcessChunk(args map[string]interface{}) (*ToolResu
 		return textError(fmt.Sprintf("chunk %d not found: %v", chunkID, err)), nil
 	}
 
-	classification := classifyChunk(chunk)
-	section := extractSection(chunk)
-	docID := buildDocID(chunk)
+	cls := classifyChunk(chunk)
+	section := extractSection(chunk, chunk.SourceID)
+	docID := sanitizeSection(cls.subject)
+	if docID == "" {
+		docID = fmt.Sprintf("chunk-%d", chunk.ID)
+	}
 
-	result, err := h.processOneChunk(chunk, classification, section, docID)
+	result, err := h.processOneChunk(chunk, cls.kind, section, docID)
 	if err != nil {
 		return textError(err.Error()), nil
 	}
 	return textResult(result), nil
 }
 
-func (h *ToolHandler) handleProcessAll(args map[string]interface{}) (*ToolResult, error) {
+func (h *ToolHandler) handleProcessAll(ctx context.Context, args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
 	if source == "" {
 		return textError("source parameter is required"), nil
@@ -631,32 +856,46 @@ func (h *ToolHandler) handleProcessAll(args map[string]interface{}) (*ToolResult
 	methods := 0
 	gotchas := 0
 
+	total := float64(len(chunks))
+	reportN(ctx, 0, total, fmt.Sprintf("processing %d chunks for %s", len(chunks), source))
+
+	// Emit ~10 progress events max so clients aren't flooded on big sources.
+	step := len(chunks) / 10
+	if step < 1 {
+		step = 1
+	}
+
 	for i := range chunks {
 		chunk := &chunks[i]
-		classification := classifyChunk(chunk)
-		section := extractSection(chunk)
-		docID := buildDocID(chunk)
-
-		if classification == "ignore" {
+		if i%step == 0 || i == len(chunks)-1 {
+			reportN(ctx, float64(i), total, fmt.Sprintf("chunk %d/%d", i+1, len(chunks)))
+		}
+		cls := classifyChunk(chunk)
+		if cls.kind == kindIgnore {
 			h.DB.UpdateChunkStatus(chunk.ID, docfetcher.ChunkProcessed)
 			ignored++
 			continue
 		}
 
-		_, err := h.processOneChunk(chunk, classification, section, docID)
-		if err != nil {
+		section := extractSection(chunk, source)
+		docID := sanitizeSection(cls.subject)
+		if docID == "" {
+			docID = fmt.Sprintf("chunk-%d", chunk.ID)
+		}
+
+		if _, err := h.processOneChunk(chunk, cls.kind, section, docID); err != nil {
 			failed++
 			continue
 		}
 		processed++
 		sections[section] = true
 
-		switch classification {
-		case "method":
+		switch cls.kind {
+		case kindMethod:
 			methods++
-		case "concept":
+		case kindConcept:
 			concepts++
-		case "gotcha":
+		case kindGotcha:
 			gotchas++
 		}
 	}
@@ -701,15 +940,14 @@ func (h *ToolHandler) handleProcessAll(args map[string]interface{}) (*ToolResult
 }
 
 // processOneChunk writes a single chunk as a doc file and updates its status.
-func (h *ToolHandler) processOneChunk(chunk *docfetcher.Chunk, classification, section, docID string) (string, error) {
-	if classification == "ignore" {
+func (h *ToolHandler) processOneChunk(chunk *docfetcher.Chunk, kind chunkKind, section, docID string) (string, error) {
+	if kind == kindIgnore {
 		if err := h.DB.UpdateChunkStatus(chunk.ID, docfetcher.ChunkProcessed); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("Chunk %d ignored.", chunk.ID), nil
 	}
 
-	// Strip the context header from content for the doc body
 	body := stripContextHeader(chunk.Content)
 
 	fm := fileformat.Frontmatter{
@@ -723,21 +961,21 @@ func (h *ToolHandler) processOneChunk(chunk *docfetcher.Chunk, classification, s
 	hb := fileformat.NewHierarchyBuilder(h.SrcmapDir, chunk.SourceID)
 	hb.EnsureStructure()
 
-	switch classification {
-	case "method":
+	switch kind {
+	case kindMethod:
 		fm.Kind = fileformat.KindMethod
-		fm.Symbol = chunk.Heading
+		fm.Symbol = docID
 		if err := hb.WriteMethod(section, &fileformat.DocFile{Frontmatter: fm, Body: "\n" + body + "\n"}); err != nil {
 			h.DB.UpdateChunkStatus(chunk.ID, docfetcher.ChunkFailed)
 			return "", fmt.Errorf("writing method doc: %w", err)
 		}
-	case "concept":
+	case kindConcept:
 		fm.Kind = fileformat.KindConcept
 		if err := hb.WriteConcept(section, &fileformat.DocFile{Frontmatter: fm, Body: "\n" + body + "\n"}); err != nil {
 			h.DB.UpdateChunkStatus(chunk.ID, docfetcher.ChunkFailed)
 			return "", fmt.Errorf("writing concept doc: %w", err)
 		}
-	case "gotcha":
+	case kindGotcha:
 		if err := hb.AppendGotcha(docID, body); err != nil {
 			h.DB.UpdateChunkStatus(chunk.ID, docfetcher.ChunkFailed)
 			return "", fmt.Errorf("writing gotcha: %w", err)
@@ -748,75 +986,109 @@ func (h *ToolHandler) processOneChunk(chunk *docfetcher.Chunk, classification, s
 		return "", err
 	}
 
-	return fmt.Sprintf("Chunk %d → %s/%s/%s.md", chunk.ID, chunk.SourceID, section, classification), nil
+	return fmt.Sprintf("Chunk %d → %s/%s/%s.md", chunk.ID, chunk.SourceID, section, kind), nil
 }
 
-// classifyChunk uses heuristics to classify a chunk as method, concept, or gotcha.
-func classifyChunk(c *docfetcher.Chunk) string {
-	content := strings.ToLower(c.Content)
-	heading := strings.ToLower(c.Heading)
+type chunkKind string
 
-	// Too short = ignore (nav fragments, footers, etc.)
+const (
+	kindMethod  chunkKind = "method"
+	kindConcept chunkKind = "concept"
+	kindGotcha  chunkKind = "gotcha"
+	kindIgnore  chunkKind = "ignore"
+)
+
+// classification is the output of classifyChunk: kind + the best subject name
+// to use as the doc file basename (e.g. "sendMessage" for methods).
+type classification struct {
+	kind    chunkKind
+	subject string
+}
+
+var (
+	// "<camelCase word>\n ... Returns <X> on success" — Telegram-style method signature.
+	methodSigRe = regexp.MustCompile(`(?m)^([a-z][a-zA-Z0-9_]{2,})\s*\n[\s\S]{0,400}?Returns\b[\s\S]{0,80}?\bon success`)
+	// Parameter table header row.
+	paramTableRe = regexp.MustCompile(`(?i)Parameter\s*\n\s*Type\s*\n\s*Required`)
+	// Directive/function-style header (Alpine, Vue, etc.).
+	directiveHeadingRe = regexp.MustCompile(`^(x-[\w-]+|v-[\w-]+|@[\w-]+)\b`)
+	// Code-like signature inside heading: requires a closed paren so
+	// narrative parentheticals like "Note (important)" don't match.
+	codeSigHeadingRe = regexp.MustCompile(`\w+\s*\([^)]*\)|^[A-Z][a-zA-Z]+\.[a-z]\w*\s*\(`)
+	// First camelCase identifier anywhere near the top of the body.
+	firstCamelIdentRe = regexp.MustCompile(`(?m)^\s*([a-z][a-zA-Z0-9_]{2,})\s*$`)
+)
+
+// classifyChunk returns the kind + subject for a chunk.
+func classifyChunk(c *docfetcher.Chunk) classification {
 	if c.EstimatedTokens < 30 {
-		return "ignore"
+		return classification{kind: kindIgnore}
 	}
 
-	// Gotcha patterns
-	gotchaPatterns := []string{"gotcha", "common mistake", "pitfall", "breaking change",
+	body := stripContextHeader(c.Content)
+	low := strings.ToLower(body)
+	heading := strings.TrimSpace(c.Heading)
+	lowHeading := strings.ToLower(heading)
+
+	gotchaMarkers := []string{"gotcha", "common mistake", "pitfall", "breaking change",
 		"caution", "warning:", "deprecated", "known issue", "watch out", "be careful"}
-	for _, p := range gotchaPatterns {
-		if strings.Contains(heading, p) || strings.Contains(content[:min(500, len(content))], p) {
-			return "gotcha"
+	for _, p := range gotchaMarkers {
+		if strings.Contains(lowHeading, p) || strings.Contains(low[:min(500, len(low))], p) {
+			return classification{kind: kindGotcha, subject: pickSubject(heading, body, c)}
 		}
 	}
 
-	// Method/API patterns — functions, directives, properties with signatures
-	methodPatterns := regexp.MustCompile(`(?i)(^|\s)(x-[\w-]+|v-[\w-]+|\w+\.\w+\(|function\s+\w+|def\s+\w+|fn\s+\w+|const\s+\w+\s*=|api\s+reference|method|directive|property|attribute|parameter|endpoint|route)`)
-	if methodPatterns.MatchString(heading) || (len(heading) > 0 && methodPatterns.MatchString(c.Content[:min(300, len(c.Content))])) {
-		return "method"
+	if m := methodSigRe.FindStringSubmatch(body); m != nil && paramTableRe.MatchString(body) {
+		return classification{kind: kindMethod, subject: m[1]}
+	}
+	if directiveHeadingRe.MatchString(heading) || codeSigHeadingRe.MatchString(heading) {
+		return classification{kind: kindMethod, subject: pickSubject(heading, body, c)}
 	}
 
-	// Default to concept
-	return "concept"
+	return classification{kind: kindConcept, subject: pickSubject(heading, body, c)}
 }
 
-// extractSection extracts a section name from the chunk's context header or heading.
-func extractSection(c *docfetcher.Chunk) string {
-	// Try to extract [Section: ...] from context header
+// pickSubject returns the best human-readable name for a chunk:
+// chunk heading → first camelCase identifier in body → chunk-N fallback.
+func pickSubject(heading, body string, c *docfetcher.Chunk) string {
+	if heading != "" {
+		return heading
+	}
+	if m := firstCamelIdentRe.FindStringSubmatch(body); m != nil {
+		return m[1]
+	}
+	return fmt.Sprintf("chunk-%d", c.ID)
+}
+
+// extractSection extracts a section name from the chunk's context header or
+// heading, guarding against the common pitfall where the page title sanitizes
+// to the source name (would produce .srcmap/docs/<src>/<src>/ nesting).
+func extractSection(c *docfetcher.Chunk, sourceName string) string {
+	sourceSan := sanitizeSection(sourceName)
+
 	if idx := strings.Index(c.Content, "[Section: "); idx >= 0 {
 		end := strings.Index(c.Content[idx:], "]")
 		if end > 0 {
-			section := c.Content[idx+10 : idx+end]
-			section = strings.TrimSpace(section)
-			if section != "" {
-				return sanitizeSection(section)
+			s := sanitizeSection(strings.TrimSpace(c.Content[idx+10 : idx+end]))
+			if s != "" && s != sourceSan {
+				return s
 			}
 		}
 	}
 
-	// Fall back to page URL path
 	if c.PageURL != "" {
-		parts := strings.Split(strings.TrimRight(c.PageURL, "/"), "/")
-		if len(parts) >= 2 {
-			section := parts[len(parts)-1]
-			if section != "" && section != "docs" && section != "index" {
-				return sanitizeSection(section)
-			}
-			if len(parts) >= 3 {
-				return sanitizeSection(parts[len(parts)-2])
+		if u, err := url.Parse(c.PageURL); err == nil {
+			segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+			for i := len(segs) - 1; i >= 0; i-- {
+				s := sanitizeSection(segs[i])
+				if s != "" && s != "docs" && s != "index" && s != sourceSan {
+					return s
+				}
 			}
 		}
 	}
 
 	return "general"
-}
-
-// buildDocID creates a unique doc ID from the chunk.
-func buildDocID(c *docfetcher.Chunk) string {
-	if c.Heading != "" {
-		return sanitizeSection(c.Heading)
-	}
-	return fmt.Sprintf("chunk-%d", c.ID)
 }
 
 // stripContextHeader removes the [Source: ...] header lines from chunk content.
@@ -859,6 +1131,30 @@ func sanitizeSection(s string) string {
 		s = strings.ReplaceAll(s, "--", "-")
 	}
 	return strings.Trim(s, "-")
+}
+
+// safeSourceDir returns the absolute path to .srcmap/docs/<source> guaranteed
+// to stay under the srcmap docs root, or "" and an error if the input tries
+// to escape (via "..", absolute paths, or weird separators).
+func (h *ToolHandler) safeSourceDir(source string) (string, error) {
+	if source == "" {
+		return "", fmt.Errorf("source is required")
+	}
+	if strings.ContainsAny(source, `/\`) || source == ".." || strings.Contains(source, "..") {
+		return "", fmt.Errorf("invalid source name %q", source)
+	}
+	root, err := filepath.Abs(filepath.Join(h.SrcmapDir, "docs"))
+	if err != nil {
+		return "", err
+	}
+	dir, err := filepath.Abs(filepath.Join(root, source))
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(dir+string(filepath.Separator), root+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid source name %q", source)
+	}
+	return dir, nil
 }
 
 // writeSectionFiles scans each section dir under .srcmap/docs/{source}/ and
@@ -1049,11 +1345,13 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 		return textError("at least one package name is required"), nil
 	}
 
+	global, _ := args["global"].(bool)
 	var requests []fetcher.FetchRequest
 	for _, name := range packageNames {
-		requests = append(requests, fetcher.ParsePackageName(name, false))
+		requests = append(requests, fetcher.ParsePackageName(name, global))
 	}
 
+	report(ctx, fmt.Sprintf("fetching %d package(s): %s", len(requests), strings.Join(packageNames, ", ")))
 	results := h.Orchestrator.FetchAll(ctx, requests)
 
 	reg := h.ParserRegistry
@@ -1062,7 +1360,9 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 	}
 
 	var output []string
-	for _, r := range results {
+	total := float64(len(results))
+	for idx, r := range results {
+		reportN(ctx, float64(idx), total, fmt.Sprintf("indexing %s", r.Request.Name))
 		if r.Err != nil {
 			output = append(output, fmt.Sprintf("✗ %s: %v", r.Request.Name, r.Err))
 			continue
@@ -1089,6 +1389,9 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 			continue
 		}
 
+		// Clear any previously-indexed symbols so repeated fetches don't
+		// accumulate duplicate rows.
+		_ = h.DB.ClearSymbolsForSource(r.Source.Name)
 		indexed := 0
 		for i := range symbols {
 			symbols[i].SourceID = r.Source.Name
@@ -1096,6 +1399,7 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 				indexed++
 			}
 		}
+		report(ctx, fmt.Sprintf("%s: indexed %d symbols", r.Source.Name, indexed))
 		output = append(output, fmt.Sprintf("✓ %s@%s fetched and indexed %d symbols", r.Source.Name, r.Source.Version, indexed))
 
 		// Write a stub index.md so srcmap_doc_map has something to serve
@@ -1163,6 +1467,7 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	var output []string
 
 	// Step 1: Check if URL is LLM-friendly (markdown, llms.txt, openapi)
+	report(ctx, "discovering content type: "+rawURL)
 	disc := docfetcher.NewDiscoveryService()
 	result, err := disc.ValidateAndClassify(ctx, rawURL, "")
 	if err != nil {
@@ -1175,6 +1480,7 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	switch {
 	case result.Found && (result.ContentType == docfetcher.ContentSingleMarkdown || result.ContentType == docfetcher.ContentLLMSIndex):
 		// LLM-friendly: fetch single file
+		report(ctx, fmt.Sprintf("fetching %s (%s)", rawURL, result.ContentType))
 		f := &docfetcher.SingleFileFetcher{}
 		page, err := f.Fetch(ctx, rawURL)
 		if err != nil {
@@ -1203,6 +1509,7 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	default:
 		// HTML or unknown — crawl the page and follow sub-URLs
 		crawler := docfetcher.NewWebCrawler()
+		report(ctx, fmt.Sprintf("crawling %s (depth=2, max %d pages, %s cap)", rawURL, crawler.MaxPages, crawler.Timeout))
 		crawled, err := crawler.Crawl(ctx, rawURL, 2)
 		if err != nil {
 			return textError(fmt.Sprintf("failed to crawl: %v", err)), nil
@@ -1217,6 +1524,7 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	}
 
 	// Chunk the content
+	report(ctx, fmt.Sprintf("chunking %d page(s)", len(pages)))
 	chunker := &docfetcher.DefaultChunker{}
 	chunks, err := chunker.ChunkWithOrigin(sourceName, rawURL, pages)
 	if err != nil {
@@ -1250,7 +1558,7 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	output = append(output, fmt.Sprintf("✓ %d chunks stored for %s — processing now...", stored, sourceName))
 
 	// Auto-process all chunks
-	processResult, _ := h.handleProcessAll(map[string]interface{}{"source": sourceName})
+	processResult, _ := h.handleProcessAll(ctx, map[string]interface{}{"source": sourceName})
 	if processResult != nil && !processResult.IsError {
 		for _, block := range processResult.Content {
 			if block.Text != "" {
@@ -1262,11 +1570,27 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 	return textResult(strings.Join(output, "\n")), nil
 }
 
+func (h *ToolHandler) handleDeleteSource(args map[string]interface{}) (*ToolResult, error) {
+	sourceName, _ := args["source"].(string)
+	docsDir, err := h.safeSourceDir(sourceName)
+	if err != nil {
+		return textError(err.Error()), nil
+	}
+
+	if err := h.DB.DeleteSource(sourceName); err != nil {
+		return textError(fmt.Sprintf("deleting source: %v", err)), nil
+	}
+	if err := os.RemoveAll(docsDir); err != nil {
+		return textResult(fmt.Sprintf("✓ deleted DB rows for %q; docs dir removal failed: %v", sourceName, err)), nil
+	}
+	return textResult(fmt.Sprintf("✓ deleted source %q (rows + %s)", sourceName, docsDir)), nil
+}
+
 func (h *ToolHandler) handleListSources(args map[string]interface{}) (*ToolResult, error) {
 	globalOnly, _ := args["global_only"].(bool)
 
 	var sources []index.SourceRecord
-	// Local DB — skip when caller wants global-only.
+	// Local DB — only if caller wants everything.
 	if !globalOnly {
 		local, err := h.DB.ListSources(false)
 		if err != nil {
@@ -1274,9 +1598,10 @@ func (h *ToolHandler) handleListSources(args map[string]interface{}) (*ToolResul
 		}
 		sources = append(sources, local...)
 	}
-	// Global DB lives at ~/.srcmap/index.db (see cmd/srcmap/commands.go
-	// runMCP). All rows there are global by definition; tag them in case
-	// the column wasn't set at write time.
+	// Global DB lives at ~/.srcmap/index.db (see cmd/srcmap/commands.go:
+	// runMCP). All rows in that DB are global by definition, but the
+	// Global column may or may not be set; tag the scope in the display
+	// layer below so it's always correct.
 	if h.GlobalDB != nil {
 		global, err := h.GlobalDB.ListSources(false)
 		if err == nil {
@@ -1412,12 +1737,139 @@ func (h *ToolHandler) AutoIngestLocalDocs(ctx context.Context, sourceName, sourc
 	fileformat.WriteSourceYAML(filepath.Join(h.SrcmapDir, "docs", sourceName, "source.yaml"), sy)
 
 	// Auto-process
-	res, _ := h.handleProcessAll(map[string]interface{}{"source": sourceName})
+	res, _ := h.handleProcessAll(ctx, map[string]interface{}{"source": sourceName})
 	summary := fmt.Sprintf("ingested %d local doc pages → %d chunks stored", len(pages), stored)
 	if res != nil && len(res.Content) > 0 {
 		summary += "\n" + res.Content[0].Text
 	}
 	return summary, nil
+}
+
+// handleUpdateSource re-fetches a single source at its latest upstream
+// version, re-parses symbols, and re-ingests local docs.
+func (h *ToolHandler) handleUpdateSource(ctx context.Context, args map[string]interface{}) (*ToolResult, error) {
+	if h.Orchestrator == nil {
+		return textError("update not available: orchestrator not configured"), nil
+	}
+	sourceName, _ := args["source"].(string)
+	if sourceName == "" {
+		return textError("source parameter is required"), nil
+	}
+	refetch := true
+	if v, ok := args["refetch"].(bool); ok {
+		refetch = v
+	}
+
+	rec, err := h.DB.GetSource(sourceName)
+	if err != nil || rec == nil {
+		return textError(fmt.Sprintf("source %q not found — run srcmap_fetch first", sourceName)), nil
+	}
+
+	src := *rec
+	var output []string
+	if refetch || src.Path == "" {
+		req := fetcher.ParsePackageName(src.Name, src.Global)
+		report(ctx, fmt.Sprintf("re-fetching %s…", src.Name))
+		results := h.Orchestrator.FetchAll(ctx, []fetcher.FetchRequest{req})
+		if len(results) == 0 || results[0].Err != nil {
+			msg := "unknown error"
+			if len(results) > 0 && results[0].Err != nil {
+				msg = results[0].Err.Error()
+			}
+			return textError(fmt.Sprintf("re-fetch failed: %s", msg)), nil
+		}
+		r := results[0]
+		previous := src.Version
+		src.Version = r.Source.Version
+		src.RepoURL = r.Source.RepoURL
+		src.Path = r.Source.Path
+		if previous != "" && previous != r.Source.Version {
+			output = append(output, fmt.Sprintf("✓ upgraded %s: %s → %s", src.Name, previous, r.Source.Version))
+		} else {
+			output = append(output, fmt.Sprintf("✓ re-fetched %s @ %s", src.Name, r.Source.Version))
+		}
+	}
+
+	reg := h.ParserRegistry
+	if reg == nil {
+		reg = parser.NewRegistry()
+	}
+	symbols, err := reg.ParseDirectory(src.Path)
+	if err != nil {
+		return textError(fmt.Sprintf("parse error: %v", err)), nil
+	}
+	_ = h.DB.ClearSymbolsForSource(src.ID)
+	indexed := 0
+	for i := range symbols {
+		symbols[i].SourceID = src.ID
+		if _, err := h.DB.InsertSymbol(&symbols[i]); err == nil {
+			indexed++
+		}
+	}
+	src.LastUpdated = time.Now().UTC().Format(time.RFC3339)
+	if err := h.DB.InsertSource(&src); err != nil {
+		return textError(fmt.Sprintf("persisting source: %v", err)), nil
+	}
+
+	// Re-ingest docs from the freshly-cloned tree.
+	if summary, err := h.AutoIngestLocalDocs(ctx, src.ID, src.Path); err == nil && summary != "" {
+		output = append(output, summary)
+	}
+
+	output = append(output, fmt.Sprintf("✓ %s: re-indexed %d symbols", src.Name, indexed))
+	return textResult(strings.Join(output, "\n")), nil
+}
+
+// handleOutdated compares each indexed source's stored version against what
+// the upstream registry reports, and returns a short report.
+func (h *ToolHandler) handleOutdated(ctx context.Context, args map[string]interface{}) (*ToolResult, error) {
+	if h.Orchestrator == nil {
+		return textError("outdated check not available: orchestrator not configured"), nil
+	}
+	sources, err := h.DB.ListSources(false)
+	if err != nil {
+		return textError(fmt.Sprintf("failed to list sources: %v", err)), nil
+	}
+	if len(sources) == 0 {
+		return textResult("No sources indexed yet."), nil
+	}
+
+	var lines []string
+	outdated := 0
+	for _, s := range sources {
+		req := fetcher.ParsePackageName(s.Name, s.Global)
+		latest, _, err := h.Orchestrator.LatestVersion(ctx, req)
+		if err != nil {
+			lines = append(lines, fmt.Sprintf("%s local:%s upstream: error (%v)", s.Name, valueOrDashStr(s.Version), err))
+			continue
+		}
+		local := strings.TrimPrefix(s.Version, "v")
+		remote := strings.TrimPrefix(latest, "v")
+		status := "up to date"
+		if local != "" && remote != "" && local != remote {
+			status = "outdated → " + latest
+			outdated++
+		} else if local == "" && remote != "" {
+			status = "unknown → " + latest
+			outdated++
+		}
+		lines = append(lines, fmt.Sprintf("%s local:%s %s", s.Name, valueOrDashStr(s.Version), status))
+	}
+
+	if outdated == 0 {
+		lines = append(lines, "", "All sources up to date.")
+	} else {
+		lines = append(lines, "",
+			fmt.Sprintf("%d source(s) behind upstream. Call srcmap_update_source(source=<name>) to update.", outdated))
+	}
+	return textResult(strings.Join(lines, "\n")), nil
+}
+
+func valueOrDashStr(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func textResult(text string) *ToolResult {

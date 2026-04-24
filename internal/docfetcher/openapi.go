@@ -22,11 +22,11 @@ type openAPISpec struct {
 }
 
 type openAPIOperation struct {
-	Summary     string `yaml:"summary"`
-	Description string `yaml:"description"`
-	OperationID string `yaml:"operationId"`
-	Tags        []string `yaml:"tags"`
-	Parameters  []openAPIParameter `yaml:"parameters"`
+	Summary     string                     `yaml:"summary"`
+	Description string                     `yaml:"description"`
+	OperationID string                     `yaml:"operationId"`
+	Tags        []string                   `yaml:"tags"`
+	Parameters  []openAPIParameter         `yaml:"parameters"`
 	Responses   map[string]openAPIResponse `yaml:"responses"`
 }
 

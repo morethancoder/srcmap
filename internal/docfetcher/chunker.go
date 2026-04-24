@@ -23,6 +23,7 @@ const (
 	DocOpenAPI           DocType = "openapi"
 	DocMarkdown          DocType = "markdown"
 	DocFlatProse         DocType = "flat-prose"
+	DocAnchorStructured  DocType = "anchor-structured"
 )
 
 // DefaultChunker splits raw pages into token-bounded chunks.
@@ -37,6 +38,7 @@ func (c *DefaultChunker) Chunk(sourceName string, pages []RawPage) ([]Chunk, err
 func (c *DefaultChunker) ChunkWithOrigin(sourceName, originURL string, pages []RawPage) ([]Chunk, error) {
 	var allChunks []Chunk
 	chunkIdx := 0
+	seenFP := map[string]struct{}{}
 
 	for _, page := range pages {
 		docType := detectDocType(page.Content)
@@ -46,6 +48,8 @@ func (c *DefaultChunker) ChunkWithOrigin(sourceName, originURL string, pages []R
 		case DocOpenAPI:
 			// Each OpenAPI page is already one operation — pass through
 			sections = []section{{heading: page.Title, content: page.Content}}
+		case DocAnchorStructured:
+			sections = splitByAnchors(page.Content)
 		case DocMarkdown:
 			sections = splitMarkdown(page.Content)
 		case DocHeadingStructured:
@@ -59,21 +63,43 @@ func (c *DefaultChunker) ChunkWithOrigin(sourceName, originURL string, pages []R
 		for _, s := range sections {
 			tokens := estimateTokens(s.content)
 			if tokens > maxTokens {
-				sized = append(sized, splitLargeSection(s)...)
+				parts := splitLargeSection(s)
+				for i := range parts {
+					if parts[i].anchorID == "" {
+						parts[i].anchorID = s.anchorID
+					}
+				}
+				sized = append(sized, parts...)
 			} else {
 				sized = append(sized, s)
 			}
 		}
 
-		// Batch small chunks
-		sized = batchSmallChunks(sized)
+		// Batch small chunks — but never for anchor-structured docs: we
+		// want exactly one chunk per named entity so the linker can map
+		// anchor → file cleanly (e.g. one Telegram method per chunk).
+		if docType != DocAnchorStructured {
+			sized = batchSmallChunks(sized)
+		}
 
 		totalChunks := len(sized)
+		pageKind := classifyPageKind(page.URL, page.Title)
 		for i, s := range sized {
 			header := buildContextHeader(sourceName, page.Title, s.heading, originURL, i+1, totalChunks)
 			content := header + "\n\n" + s.content
 
 			h := sha256.Sum256([]byte(s.content))
+			fp := fmt.Sprintf("%x", h)
+			if _, dup := seenFP[fp]; dup {
+				continue
+			}
+			seenFP[fp] = struct{}{}
+
+			kind := pageKind
+			if kind == ChunkKindDoc && isChangelogHeading(s.heading) {
+				kind = ChunkKindChangelog
+			}
+
 			allChunks = append(allChunks, Chunk{
 				SourceID:        sourceName,
 				PageURL:         page.URL,
@@ -81,8 +107,10 @@ func (c *DefaultChunker) ChunkWithOrigin(sourceName, originURL string, pages []R
 				Heading:         s.heading,
 				Content:         content,
 				EstimatedTokens: estimateTokens(content),
-				Fingerprint:     fmt.Sprintf("%x", h),
+				Fingerprint:     fp,
 				Status:          ChunkPending,
+				Kind:            kind,
+				AnchorID:        s.anchorID,
 			})
 			chunkIdx++
 		}
@@ -92,8 +120,9 @@ func (c *DefaultChunker) ChunkWithOrigin(sourceName, originURL string, pages []R
 }
 
 type section struct {
-	heading string
-	content string
+	heading  string
+	content  string
+	anchorID string
 }
 
 // estimateTokens estimates token count: word_count * 1.3
@@ -109,6 +138,12 @@ var (
 )
 
 func detectDocType(content string) DocType {
+	// Anchor markers injected by the crawler take priority — they carry
+	// semantic boundaries we want to preserve (one method = one chunk).
+	if strings.Contains(content, AnchorMarker) {
+		return DocAnchorStructured
+	}
+
 	// Check for markdown headings
 	if mdHeading2Re.MatchString(content) || mdHeading3Re.MatchString(content) {
 		return DocMarkdown
@@ -120,6 +155,68 @@ func detectDocType(content string) DocType {
 	}
 
 	return DocFlatProse
+}
+
+var anchorSplitRe = regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(AnchorMarker) + `([^@\n]+)@@\s*$`)
+
+// splitByAnchors splits content at injected `@@SMANCHOR:id@@` markers.
+// Each section gets the anchor ID stored so downstream tools can route
+// by stable name rather than by heading text alone.
+func splitByAnchors(content string) []section {
+	locs := anchorSplitRe.FindAllStringSubmatchIndex(content, -1)
+	if len(locs) == 0 {
+		return []section{{content: content}}
+	}
+	var out []section
+	// Preamble before first anchor.
+	if locs[0][0] > 0 {
+		pre := strings.TrimSpace(content[:locs[0][0]])
+		if pre != "" {
+			out = append(out, section{heading: "Introduction", content: pre})
+		}
+	}
+	for i, loc := range locs {
+		id := content[loc[2]:loc[3]]
+		end := len(content)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		body := strings.TrimSpace(content[loc[1]:end])
+		heading := extractSectionHeading(body)
+		if heading == "" {
+			heading = id
+		}
+		// Strip any residual marker from body.
+		body = anchorSplitRe.ReplaceAllString(body, "")
+		out = append(out, section{
+			heading:  heading,
+			content:  strings.TrimSpace(body),
+			anchorID: id,
+		})
+	}
+	return out
+}
+
+var (
+	// Anchor tightly — `history` / `releases` as bare segments occur in
+	// plenty of non-changelog URLs (e.g. /api/browser-history,
+	// /repos/{o}/{r}/releases). Rely on title heuristics there instead.
+	changelogURLRe = regexp.MustCompile(`(?i)(?:^|/)(?:changelog|release-notes|whats-new|whatsnew|releasenotes|news)(?:/|$|[#?])`)
+	changelogHRe   = regexp.MustCompile(`(?i)^(changelog|release notes|recent changes|what'?s new|history|releases?\b|version \d)`)
+)
+
+func classifyPageKind(pageURL, title string) ChunkKind {
+	if changelogURLRe.MatchString(pageURL) {
+		return ChunkKindChangelog
+	}
+	if changelogHRe.MatchString(strings.TrimSpace(title)) {
+		return ChunkKindChangelog
+	}
+	return ChunkKindDoc
+}
+
+func isChangelogHeading(h string) bool {
+	return changelogHRe.MatchString(strings.TrimSpace(h))
 }
 
 func splitMarkdown(content string) []section {

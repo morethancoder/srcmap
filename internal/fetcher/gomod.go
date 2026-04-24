@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/morethancoder/srcmap/internal/httpx"
 )
 
 // GoModRegistry resolves Go modules to their repository.
@@ -25,7 +27,7 @@ func (r *GoModRegistry) client() *http.Client {
 	if r.Client != nil {
 		return r.Client
 	}
-	return http.DefaultClient
+	return httpx.Default()
 }
 
 // Resolve looks up a Go module and returns its repo URL and latest version.

@@ -2,6 +2,7 @@ package docfetcher_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -434,7 +435,7 @@ func TestChunkerFlatProse(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		words := make([]string, 100)
 		for j := range words {
-			words[j] = "word"
+			words[j] = fmt.Sprintf("w%d_%d", i, j)
 		}
 		paragraphs = append(paragraphs, strings.Join(words, " "))
 	}
@@ -457,5 +458,102 @@ func TestChunkerFlatProse(t *testing.T) {
 		if bodyTokens > 9000 {
 			t.Errorf("chunk %d has ~%d tokens, too large", i, bodyTokens)
 		}
+	}
+}
+
+// --- Batch A tests: nav strip, anchor chunking, dedup, changelog tag ---
+
+func TestNavAndChromeStripped(t *testing.T) {
+	html := `<html><body>
+<nav><a href="/">Home</a><a href="/api">API</a></nav>
+<header>site-header</header>
+<main><h2 id="real">Real Heading</h2><p>real body text goes here with enough words to survive filtering of the page.</p></main>
+<footer>© 2026 Something</footer>
+<aside><ul class="sidebar"><li>menu item</li></ul></aside>
+</body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(html))
+	}))
+	defer srv.Close()
+
+	crawler := docfetcher.NewWebCrawler()
+	crawler.MaxDepth = 0
+	pages, err := crawler.Crawl(context.Background(), srv.URL, 1)
+	if err != nil {
+		t.Fatalf("crawl: %v", err)
+	}
+	if len(pages) == 0 {
+		t.Fatal("no pages")
+	}
+	got := pages[0].Content
+	for _, banned := range []string{"site-header", "© 2026", "menu item"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("content still has chrome %q:\n%s", banned, got)
+		}
+	}
+	if !strings.Contains(got, "real body text") {
+		t.Errorf("main body missing:\n%s", got)
+	}
+	if !strings.Contains(got, docfetcher.AnchorMarker+"real") {
+		t.Errorf("anchor marker not preserved:\n%s", got)
+	}
+}
+
+func TestAnchorChunkingOneMethodPerChunk(t *testing.T) {
+	content := "preamble text\n\n" +
+		docfetcher.AnchorMarker + "sendMessage@@\nH4 sendMessage\n\nUse this method to send text. Params: chat_id, text. Returns Message.\n\n" +
+		docfetcher.AnchorMarker + "sendPhoto@@\nH4 sendPhoto\n\nUse this method to send a photo. Params: chat_id, photo. Returns Message.\n\n" +
+		docfetcher.AnchorMarker + "sendAudio@@\nH4 sendAudio\n\nUse this method to send audio. Params: chat_id, audio. Returns Message.\n"
+	chunker := &docfetcher.DefaultChunker{}
+	pages := []docfetcher.RawPage{{URL: "http://x/api", Title: "API", Content: content}}
+	chunks, err := chunker.Chunk("src", pages)
+	if err != nil {
+		t.Fatalf("chunk: %v", err)
+	}
+	anchors := map[string]bool{}
+	for _, c := range chunks {
+		if c.AnchorID != "" {
+			anchors[c.AnchorID] = true
+		}
+	}
+	for _, want := range []string{"sendMessage", "sendPhoto", "sendAudio"} {
+		if !anchors[want] {
+			t.Errorf("missing chunk for anchor %q (got %v)", want, anchors)
+		}
+	}
+}
+
+func TestChunkDedup(t *testing.T) {
+	// Same body repeated across pages should collapse to one chunk.
+	body := "This is repeated chrome content that appears on every page of the site with enough tokens to survive."
+	pages := []docfetcher.RawPage{
+		{URL: "http://x/a", Content: body},
+		{URL: "http://x/b", Content: body},
+		{URL: "http://x/c", Content: body},
+	}
+	chunks, err := (&docfetcher.DefaultChunker{}).Chunk("src", pages)
+	if err != nil {
+		t.Fatalf("chunk: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Errorf("expected 1 deduped chunk, got %d", len(chunks))
+	}
+}
+
+func TestChangelogKindTagged(t *testing.T) {
+	pages := []docfetcher.RawPage{{
+		URL:     "https://example.com/changelog",
+		Title:   "Changelog",
+		Content: "H2 Version 1.2\n\nAdded thing. Fixed bug. Deprecated old. Words to pad this out so it survives batching as its own chunk reliably for the purposes of this test case.",
+	}}
+	chunks, err := (&docfetcher.DefaultChunker{}).Chunk("src", pages)
+	if err != nil {
+		t.Fatalf("chunk: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("no chunks")
+	}
+	if chunks[0].Kind != docfetcher.ChunkKindChangelog {
+		t.Errorf("expected changelog kind, got %q", chunks[0].Kind)
 	}
 }

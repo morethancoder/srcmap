@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 
+	"github.com/morethancoder/srcmap/internal/logging"
 	"github.com/spf13/cobra"
 )
 
@@ -59,14 +60,27 @@ var sourcesCmd = &cobra.Command{
 
 var updateCmd = &cobra.Command{
 	Use:   "update [source]",
-	Short: "Incrementally update a source (or all with --all)",
-	RunE:  runUpdate,
+	Short: "Update a source: re-clone latest upstream version, re-parse symbols, re-ingest docs",
+	Long: `Update an indexed source. With --refetch (default for sources whose local clone is missing) srcmap pulls the latest upstream version, re-parses every symbol, and re-ingests local docs. Use --all to apply to every indexed source.
+
+Examples:
+  srcmap update zod             # re-parse zod from whatever is on disk
+  srcmap update zod --refetch   # pull the latest version and re-index
+  srcmap update --all --refetch # update everything
+  srcmap outdated               # preview what's behind before updating`,
+	RunE: runUpdate,
 }
 
 var checkCmd = &cobra.Command{
 	Use:   "check",
-	Short: "Check all sources for available updates without modifying anything",
+	Short: "Report processing status (pending/processed/failed chunks) for every indexed source",
 	RunE:  runCheck,
+}
+
+var outdatedCmd = &cobra.Command{
+	Use:   "outdated",
+	Short: "Query upstream registries for each source and report which local versions are behind",
+	RunE:  runOutdated,
 }
 
 var mcpCmd = &cobra.Command{
@@ -111,6 +125,15 @@ var linkCmd = &cobra.Command{
 }
 
 func init() {
+	// global flags
+	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable debug logging")
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		verbose, _ := cmd.Flags().GetBool("verbose")
+		// mcp speaks JSON-RPC on stdout → force JSON logs on stderr
+		jsonOut := cmd.Name() == mcpCmd.Use
+		logging.Init(verbose, jsonOut)
+	}
+
 	// fetch flags
 	fetchCmd.Flags().Bool("global", false, "Store in global ~/.srcmap/ scope")
 
@@ -122,7 +145,8 @@ func init() {
 
 	// update flags
 	updateCmd.Flags().Bool("all", false, "Update all sources")
-	updateCmd.Flags().Bool("full", false, "Force full re-crawl")
+	updateCmd.Flags().Bool("full", false, "Force full re-index")
+	updateCmd.Flags().Bool("refetch", false, "Re-clone the source from upstream at the latest version")
 
 	// sources flags
 	sourcesCmd.Flags().Bool("global", false, "List global sources")
@@ -142,6 +166,7 @@ func init() {
 		sourcesCmd,
 		updateCmd,
 		checkCmd,
+		outdatedCmd,
 		mcpCmd,
 		agentCmd,
 		initCmd,

@@ -20,17 +20,92 @@ func (db *DB) InsertDocFile(sourceID string, fm *fileformat.Frontmatter, filePat
 	return nil
 }
 
-// InsertChunk stores a pre-chunked documentation block.
+// InsertChunk stores a pre-chunked documentation block and indexes it in FTS5.
+// Both writes run in one transaction so chunks and chunks_fts never drift.
+// If a chunk with the same (source_id, fingerprint) already exists, returns
+// the existing ID and skips the insert so re-ingestion is idempotent.
 func (db *DB) InsertChunk(c *docfetcher.Chunk) (int64, error) {
-	res, err := db.conn.Exec(
-		`INSERT INTO chunks (source_id, page_url, chunk_index, heading, content, estimated_tokens, fingerprint, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.SourceID, c.PageURL, c.ChunkIndex, c.Heading, c.Content, c.EstimatedTokens, c.Fingerprint, string(c.Status),
+	if c.Fingerprint != "" {
+		var existing int64
+		err := db.conn.QueryRow(
+			`SELECT id FROM chunks WHERE source_id = ? AND fingerprint = ? LIMIT 1`,
+			c.SourceID, c.Fingerprint,
+		).Scan(&existing)
+		if err == nil {
+			return existing, nil
+		}
+	}
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	kind := c.Kind
+	if kind == "" {
+		kind = docfetcher.ChunkKindDoc
+	}
+	res, err := tx.Exec(
+		`INSERT INTO chunks (source_id, page_url, chunk_index, heading, content, estimated_tokens, fingerprint, status, kind, anchor_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.SourceID, c.PageURL, c.ChunkIndex, c.Heading, c.Content, c.EstimatedTokens, c.Fingerprint, string(c.Status), string(kind), c.AnchorID,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("inserting chunk: %w", err)
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO chunks_fts (content, heading, source_id, chunk_id) VALUES (?, ?, ?, ?)`,
+		c.Content, c.Heading, c.SourceID, id,
+	); err != nil {
+		return 0, fmt.Errorf("indexing chunk in fts: %w", err)
+	}
+	return id, tx.Commit()
+}
+
+// DocMatch is one ranked FTS5 result with a snippet.
+type DocMatch struct {
+	ChunkID int64
+	Heading string
+	Snippet string
+	Rank    float64
+}
+
+// SearchDocs runs an FTS5 query scoped to a single source, BM25-ranked,
+// returning a highlighted snippet for each hit.
+func (db *DB) SearchDocs(sourceID, query string, limit int) ([]DocMatch, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	// snippet(col, 0, prefix, suffix, ellipsis, numTokens)
+	rows, err := db.conn.Query(
+		`SELECT chunk_id, heading,
+		        snippet(chunks_fts, 0, '«', '»', '…', 24) AS sn,
+		        bm25(chunks_fts) AS rank
+		 FROM chunks_fts
+		 WHERE chunks_fts MATCH ? AND source_id = ?
+		 ORDER BY rank ASC
+		 LIMIT ?`,
+		query, sourceID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("fts5 search: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DocMatch
+	for rows.Next() {
+		var m DocMatch
+		if err := rows.Scan(&m.ChunkID, &m.Heading, &m.Snippet, &m.Rank); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // UpdateChunkStatus sets the processing status of a chunk.
@@ -46,16 +121,17 @@ func (db *DB) UpdateChunkStatus(chunkID int64, status docfetcher.ChunkStatus) er
 func (db *DB) GetChunk(chunkID int64) (*docfetcher.Chunk, error) {
 	row := db.conn.QueryRow(
 		`SELECT id, source_id, page_url, chunk_index, heading, content,
-		        estimated_tokens, fingerprint, status
+		        estimated_tokens, fingerprint, status, kind, anchor_id
 		 FROM chunks WHERE id = ?`, chunkID,
 	)
 	var c docfetcher.Chunk
-	var status string
+	var status, kind string
 	if err := row.Scan(&c.ID, &c.SourceID, &c.PageURL, &c.ChunkIndex, &c.Heading,
-		&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status); err != nil {
+		&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status, &kind, &c.AnchorID); err != nil {
 		return nil, fmt.Errorf("getting chunk: %w", err)
 	}
 	c.Status = docfetcher.ChunkStatus(status)
+	c.Kind = docfetcher.ChunkKind(kind)
 	return &c, nil
 }
 
@@ -63,7 +139,7 @@ func (db *DB) GetChunk(chunkID int64) (*docfetcher.Chunk, error) {
 func (db *DB) GetPendingChunks(sourceID string) ([]docfetcher.Chunk, error) {
 	rows, err := db.conn.Query(
 		`SELECT id, source_id, page_url, chunk_index, heading, content,
-		        estimated_tokens, fingerprint, status
+		        estimated_tokens, fingerprint, status, kind, anchor_id
 		 FROM chunks WHERE source_id = ? AND status = ?
 		 ORDER BY id ASC`,
 		sourceID, string(docfetcher.ChunkPending),
@@ -76,12 +152,13 @@ func (db *DB) GetPendingChunks(sourceID string) ([]docfetcher.Chunk, error) {
 	var chunks []docfetcher.Chunk
 	for rows.Next() {
 		var c docfetcher.Chunk
-		var status string
+		var status, kind string
 		if err := rows.Scan(&c.ID, &c.SourceID, &c.PageURL, &c.ChunkIndex, &c.Heading,
-			&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status); err != nil {
-			continue
+			&c.Content, &c.EstimatedTokens, &c.Fingerprint, &status, &kind, &c.AnchorID); err != nil {
+			return nil, fmt.Errorf("scanning pending chunk: %w", err)
 		}
 		c.Status = docfetcher.ChunkStatus(status)
+		c.Kind = docfetcher.ChunkKind(kind)
 		chunks = append(chunks, c)
 	}
 	return chunks, rows.Err()

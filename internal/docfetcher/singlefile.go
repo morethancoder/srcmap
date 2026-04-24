@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+
+	"github.com/morethancoder/srcmap/internal/httpx"
+	"github.com/morethancoder/srcmap/internal/logging"
 )
 
 // SingleFileFetcher fetches a single markdown/text file from a URL.
@@ -17,8 +21,10 @@ type SingleFileFetcher struct {
 func (f *SingleFileFetcher) Fetch(ctx context.Context, url string) (*RawPage, error) {
 	client := f.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = httpx.Default()
 	}
+
+	t := logging.Stage("doc.fetch", "url", url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -39,12 +45,23 @@ func (f *SingleFileFetcher) Fetch(ctx context.Context, url string) (*RawPage, er
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
+	t.Done("url", url, "bytes", len(body))
 
-	h := sha256.Sum256(body)
+	content := string(body)
+	title := ""
+	ctype := resp.Header.Get("Content-Type")
+	isHTML := strings.Contains(ctype, "text/html") ||
+		(ctype == "" && strings.Contains(content[:min(len(content), 512)], "<html"))
+	if isHTML {
+		title = extractTitle(content)
+		content = extractText(content)
+	}
+
+	h := sha256.Sum256([]byte(content))
 	return &RawPage{
 		URL:         url,
-		Title:       "", // will be extracted during chunking
-		Content:     string(body),
+		Title:       title,
+		Content:     content,
 		Fingerprint: fmt.Sprintf("%x", h),
 	}, nil
 }

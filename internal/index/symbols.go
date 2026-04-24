@@ -20,6 +20,28 @@ func (db *DB) InsertSymbol(s *parser.Symbol) (int64, error) {
 	return res.LastInsertId()
 }
 
+// ClearSymbolsForSource deletes every symbol row owned by the given source
+// plus the doc_links referencing those symbol IDs. Call this before
+// re-parsing a source so repeated fetches don't accumulate duplicate rows.
+func (db *DB) ClearSymbolsForSource(sourceID string) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`DELETE FROM doc_links WHERE symbol_id IN (SELECT id FROM symbols WHERE source_id = ?)`,
+		sourceID,
+	); err != nil {
+		return fmt.Errorf("delete doc_links: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM symbols WHERE source_id = ?`, sourceID); err != nil {
+		return fmt.Errorf("delete symbols: %w", err)
+	}
+	return tx.Commit()
+}
+
 // LookupSymbol finds a symbol by source and name.
 func (db *DB) LookupSymbol(sourceID, name string) (*parser.Symbol, error) {
 	row := db.conn.QueryRow(

@@ -6,9 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/morethancoder/srcmap/internal/httpx"
+	"github.com/morethancoder/srcmap/internal/logging"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
 )
+
+// DefaultResolveTimeout caps registry metadata lookups.
+const DefaultResolveTimeout = 20 * time.Second
 
 // PackageType identifies the ecosystem of a package.
 type PackageType string
@@ -46,11 +53,12 @@ type Orchestrator struct {
 
 // NewOrchestrator creates an Orchestrator with default registries.
 func NewOrchestrator(projectDir, globalDir string) *Orchestrator {
+	client := httpx.Default()
 	return &Orchestrator{
 		Registries: map[PackageType]Registry{
-			PackageNPM:   &NPMRegistry{},
-			PackagePyPI:  &PyPIRegistry{},
-			PackageGoMod: &GoModRegistry{},
+			PackageNPM:   &NPMRegistry{Client: client},
+			PackagePyPI:  &PyPIRegistry{Client: client},
+			PackageGoMod: &GoModRegistry{Client: client},
 		},
 		GitFetcher:  &GitFetcher{},
 		ProjectDir:  projectDir,
@@ -90,6 +98,26 @@ func ParsePackageName(input string, global bool) FetchRequest {
 	return FetchRequest{Name: input, Type: PackageNPM, Global: global}
 }
 
+// LatestVersion resolves the latest upstream version for a package without
+// cloning it. Returns (version, repoURL, error). Uses the registry for the
+// ecosystem inferred from `req.Type`; GitHub refs always resolve to "HEAD".
+func (o *Orchestrator) LatestVersion(ctx context.Context, req FetchRequest) (string, string, error) {
+	if req.Type == PackageGitHub {
+		return "HEAD", "https://github.com/" + req.Name, nil
+	}
+	reg, ok := o.Registries[req.Type]
+	if !ok {
+		return "", "", fmt.Errorf("unsupported package type: %s", req.Type)
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, DefaultResolveTimeout)
+	defer cancel()
+	res, err := reg.Resolve(resolveCtx, req.Name)
+	if err != nil {
+		return "", "", err
+	}
+	return res.Version, res.RepoURL, nil
+}
+
 // FetchAll fetches multiple packages concurrently.
 func (o *Orchestrator) FetchAll(ctx context.Context, requests []FetchRequest) []FetchResult {
 	results := make([]FetchResult, len(requests))
@@ -99,12 +127,18 @@ func (o *Orchestrator) FetchAll(ctx context.Context, requests []FetchRequest) []
 
 	for i, req := range requests {
 		g.Go(func() error {
+			t := logging.Stage("fetch", "pkg", req.Name, "type", string(req.Type), "global", req.Global)
 			source, err := o.fetchOne(ctx, req)
 			results[i] = FetchResult{Request: req, Err: err}
 			if source != nil {
 				results[i].Source = *source
 			}
-			return nil // Don't cancel other fetches on error
+			if err != nil {
+				t.Fail(err, "pkg", req.Name)
+			} else {
+				t.Done("pkg", req.Name, "version", source.Version, "path", source.Path)
+			}
+			return nil // keep fetching the rest on error
 		})
 	}
 
@@ -128,10 +162,15 @@ func (o *Orchestrator) fetchOne(ctx context.Context, req FetchRequest) (*Source,
 			return nil, fmt.Errorf("unsupported package type: %s", req.Type)
 		}
 
-		result, err := reg.Resolve(ctx, req.Name)
+		resolveCtx, cancel := context.WithTimeout(ctx, DefaultResolveTimeout)
+		t := logging.Stage("resolve", "pkg", req.Name, "type", string(req.Type))
+		result, err := reg.Resolve(resolveCtx, req.Name)
+		cancel()
 		if err != nil {
+			t.Fail(err, "pkg", req.Name)
 			return nil, fmt.Errorf("resolving %s: %w", req.Name, err)
 		}
+		t.Done("pkg", req.Name, "repo", result.RepoURL, "version", result.Version)
 		repoURL = result.RepoURL
 		version = result.Version
 
@@ -149,6 +188,7 @@ func (o *Orchestrator) fetchOne(ctx context.Context, req FetchRequest) (*Source,
 
 	// Skip if already fetched
 	if _, err := os.Stat(destDir); err == nil {
+		log.Info().Str("pkg", req.Name).Str("path", destDir).Msg("cache hit — skipping clone")
 		return &Source{
 			Name:    req.Name,
 			Version: version,
