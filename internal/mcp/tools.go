@@ -95,7 +95,8 @@ func (h *ToolHandler) AllTools() []Tool {
 		{
 			Name: "srcmap_lookup",
 			Description: "Exact-name lookup of a code symbol (function / method / type / constant). " +
-				"Returns file path, line range, parameters, and return type. " +
+				"Returns file path, line range, parameters, return type, AND the actual source lines inline (capped at 300 lines). " +
+				"You should NOT need to open the file separately — everything you need to read or paste is in the response. " +
 				"If you don't know the exact name, use srcmap_find instead.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
@@ -418,7 +419,48 @@ func (h *ToolHandler) handleLookup(args map[string]interface{}) (*ToolResult, er
 	if sym.ReturnType != "" {
 		text += fmt.Sprintf("\nReturns: %s", sym.ReturnType)
 	}
+
+	// Inline the actual source lines so the agent doesn't have to open the
+	// file. Cap the snippet at a few hundred lines for huge definitions so
+	// the tool stays snappy.
+	if snippet := readSnippet(sym.FilePath, sym.StartLine, sym.EndLine, 300); snippet != "" {
+		text += "\n\n```\n" + snippet + "\n```"
+	}
 	return textResult(text), nil
+}
+
+// readSnippet reads lines [start,end] (1-indexed, inclusive) from path,
+// capped at maxLines. Returns the snippet or "" on any error. Appends a
+// truncation notice if the range was clipped.
+func readSnippet(path string, start, end, maxLines int) string {
+	if path == "" || start < 1 || end < start {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	if start > len(lines) {
+		return ""
+	}
+	// Convert to 0-indexed slice bounds.
+	from := start - 1
+	to := end
+	if to > len(lines) {
+		to = len(lines)
+	}
+
+	clipped := false
+	if to-from > maxLines {
+		to = from + maxLines
+		clipped = true
+	}
+	snippet := strings.Join(lines[from:to], "\n")
+	if clipped {
+		snippet += fmt.Sprintf("\n// ... (truncated to %d lines; full range is %d-%d)", maxLines, start, end)
+	}
+	return snippet
 }
 
 func (h *ToolHandler) handleSearchCode(args map[string]interface{}) (*ToolResult, error) {
@@ -1667,6 +1709,66 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// scanPerComponentDocs looks for per-component markdown in common monorepo
+// layouts. Picks up antd-mobile's src/components/<x>/index.{en,zh}.md,
+// npm workspaces' packages/<x>/README.md, and plain components/<x>/*.md.
+// Filters out tests, fixtures, and changelogs so the auto-ingest stays
+// focused on API-level content.
+func scanPerComponentDocs(sourcePath string) []docfetcher.RawPage {
+	var pages []docfetcher.RawPage
+	roots := []string{
+		filepath.Join(sourcePath, "src", "components"),
+		filepath.Join(sourcePath, "packages"),
+		filepath.Join(sourcePath, "components"),
+	}
+	wanted := map[string]bool{
+		"index.en.md": true, "index.md": true, "index.zh.md": true,
+		"README.md": true, "readme.md": true, "README.MD": true,
+	}
+	for _, root := range roots {
+		st, err := os.Stat(root)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			comp := e.Name()
+			// Skip obvious non-component dirs.
+			switch comp {
+			case "tests", "test", "__tests__", "demos", "fixtures", "utils", "node_modules":
+				continue
+			}
+			compDir := filepath.Join(root, comp)
+			compEntries, err := os.ReadDir(compDir)
+			if err != nil {
+				continue
+			}
+			for _, f := range compEntries {
+				if f.IsDir() || !wanted[f.Name()] {
+					continue
+				}
+				fp := filepath.Join(compDir, f.Name())
+				b, err := os.ReadFile(fp)
+				if err != nil {
+					continue
+				}
+				pages = append(pages, docfetcher.RawPage{
+					URL:     filepath.Join(filepath.Base(root), comp, f.Name()),
+					Title:   comp,
+					Content: string(b),
+				})
+			}
+		}
+	}
+	return pages
+}
+
 // AutoIngestLocalDocs scans a freshly-fetched source directory for
 // README / docs / doc folders, chunks markdown, stores chunks, and
 // auto-processes them into the srcmap doc hierarchy. Returns a summary.
@@ -1701,6 +1803,11 @@ func (h *ToolHandler) AutoIngestLocalDocs(ctx context.Context, sourceName, sourc
 			}
 		}
 	}
+
+	// Per-component docs in monorepos: src/components/<name>/index*.md,
+	// packages/<name>/README.md, components/<name>/README.md, etc. These
+	// hold the real API tables and prop tables that top-level docs/ don't.
+	pages = append(pages, scanPerComponentDocs(sourcePath)...)
 
 	if len(pages) == 0 {
 		return "no local docs found (no README or docs/ folder)", nil
