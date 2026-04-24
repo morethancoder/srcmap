@@ -29,6 +29,11 @@ type ToolHandler struct {
 	// Optional: set these to enable srcmap_fetch and srcmap_docs_add tools.
 	Orchestrator   *fetcher.Orchestrator
 	ParserRegistry *parser.Registry
+
+	// Optional: a second index.db at ~/.srcmap/index.db for global sources.
+	// When set, srcmap_list_sources merges across scopes so agents can see
+	// both project-local and user-global sources in one response.
+	GlobalDB *index.DB
 }
 
 // NewToolHandler creates a tool handler.
@@ -1259,9 +1264,27 @@ func (h *ToolHandler) handleDocsAdd(ctx context.Context, args map[string]interfa
 
 func (h *ToolHandler) handleListSources(args map[string]interface{}) (*ToolResult, error) {
 	globalOnly, _ := args["global_only"].(bool)
-	sources, err := h.DB.ListSources(globalOnly)
-	if err != nil {
-		return textError(fmt.Sprintf("failed to list sources: %v", err)), nil
+
+	var sources []index.SourceRecord
+	// Local DB — skip when caller wants global-only.
+	if !globalOnly {
+		local, err := h.DB.ListSources(false)
+		if err != nil {
+			return textError(fmt.Sprintf("failed to list local sources: %v", err)), nil
+		}
+		sources = append(sources, local...)
+	}
+	// Global DB lives at ~/.srcmap/index.db (see cmd/srcmap/commands.go
+	// runMCP). All rows there are global by definition; tag them in case
+	// the column wasn't set at write time.
+	if h.GlobalDB != nil {
+		global, err := h.GlobalDB.ListSources(false)
+		if err == nil {
+			for i := range global {
+				global[i].Global = true
+			}
+			sources = append(sources, global...)
+		}
 	}
 
 	if len(sources) == 0 {

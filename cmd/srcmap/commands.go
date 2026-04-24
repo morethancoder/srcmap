@@ -25,6 +25,28 @@ func openDB() (*index.DB, error) {
 	return index.Open(filepath.Join(".srcmap", "index.db"))
 }
 
+// openGlobalDB opens (or creates) the global SQLite index at
+// <globalPath>/index.db. Global sources get their own DB so cross-project
+// queries don't bleed into project-local state.
+func openGlobalDB(globalPath string) (*index.DB, error) {
+	if globalPath == "" {
+		globalPath = config.DefaultGlobalPath()
+	}
+	if err := os.MkdirAll(globalPath, 0o755); err != nil {
+		return nil, err
+	}
+	return index.Open(filepath.Join(globalPath, "index.db"))
+}
+
+// resolveGlobalPath picks the effective global path from config with a
+// sensible fallback.
+func resolveGlobalPath(cfg *config.Config) string {
+	if cfg != nil && cfg.GlobalPath != "" {
+		return cfg.GlobalPath
+	}
+	return config.DefaultGlobalPath()
+}
+
 func ensureSrcmapDir() {
 	dirs := []string{
 		filepath.Join(".srcmap", "sources"),
@@ -60,8 +82,15 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	results := orch.FetchAll(ctx, requests)
 
-	// Open DB for indexing
-	db, err := openDB()
+	// --global writes source records + symbols to ~/.srcmap/index.db so
+	// global sources stay isolated from project-local state. Without
+	// --global we write to .srcmap/index.db as before.
+	var db *index.DB
+	if global {
+		db, err = openGlobalDB(resolveGlobalPath(cfg))
+	} else {
+		db, err = openDB()
+	}
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
@@ -315,7 +344,14 @@ func runList(cmd *cobra.Command, args []string) error {
 func runSources(cmd *cobra.Command, args []string) error {
 	globalOnly, _ := cmd.Flags().GetBool("global")
 
-	db, err := openDB()
+	var db *index.DB
+	var err error
+	if globalOnly {
+		cfg, _ := config.Load(config.ConfigPath(true))
+		db, err = openGlobalDB(resolveGlobalPath(cfg))
+	} else {
+		db, err = openDB()
+	}
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
@@ -364,6 +400,13 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	handler := mcp.NewToolHandler(db, ".srcmap")
 	handler.Orchestrator = fetcher.NewOrchestrator(cwd, globalPath)
 	handler.ParserRegistry = parser.NewRegistry()
+
+	// Best-effort open of the global DB so list_sources can merge across
+	// scopes. Failure is non-fatal: the server just runs local-only.
+	if gdb, gerr := openGlobalDB(globalPath); gerr == nil {
+		handler.GlobalDB = gdb
+		defer gdb.Close()
+	}
 
 	server := mcp.NewStdioServer(handler, os.Stdin, os.Stdout)
 	return server.Serve(context.Background())
