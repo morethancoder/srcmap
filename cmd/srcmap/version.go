@@ -74,7 +74,8 @@ var versionCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf("srcmap %s\n\n", resolvedVersion())
 		fmt.Println("Update with:")
-		fmt.Println("  go install github.com/morethancoder/srcmap/cmd/srcmap@latest")
+		fmt.Println("  srcmap self-update")
+		fmt.Println("  # or: go install " + srcmapModulePath + "@latest")
 		return nil
 	},
 }

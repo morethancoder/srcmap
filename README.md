@@ -31,7 +31,22 @@ Or build from source:
 git clone https://github.com/morethancoder/srcmap.git
 cd srcmap
 go build -o srcmap ./cmd/srcmap
+# or: make build    (builds ./bin/srcmap)
+# or: make install  (installs to $GOPATH/bin)
 ```
+
+### Updating
+
+```bash
+srcmap self-update                                              # from anywhere
+# equivalent to:
+go install github.com/morethancoder/srcmap/cmd/srcmap@latest
+
+# from a clone:
+make update
+```
+
+`srcmap version` prints the currently installed version and repeats the update command so you never have to remember it.
 
 ## Quick Start
 
