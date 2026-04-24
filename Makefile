@@ -14,7 +14,7 @@ PLATFORMS := \
 	windows/amd64 \
 	windows/arm64
 
-.PHONY: build build-all install update clean test lint fmt vet
+.PHONY: build build-all install upgrade clean test lint fmt vet
 
 ## build: build for current platform
 build:
@@ -37,8 +37,8 @@ build-all: clean
 install:
 	go install -ldflags '$(LDFLAGS)' $(ENTRY)
 
-## update: pull the latest published srcmap from GitHub and install it
-update:
+## upgrade: pull the latest published srcmap from GitHub and install it
+upgrade:
 	go install $(MODULE)/cmd/srcmap@latest
 
 ## test: run all tests with race detector

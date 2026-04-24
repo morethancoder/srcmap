@@ -43,7 +43,7 @@ srcmap upgrade                                                  # from anywhere
 go install github.com/morethancoder/srcmap/cmd/srcmap@latest
 
 # from a clone:
-make update
+make upgrade
 ```
 
 `srcmap version` prints the currently installed version and repeats the upgrade command so you never have to remember it.

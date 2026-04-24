@@ -103,7 +103,7 @@ func parsePseudoVersion(v string) (sha, date string) {
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
-	Short: "Print the srcmap version and how to update it",
+	Short: "Print the srcmap version and how to upgrade it",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf("srcmap %s\n\n", resolvedVersion())
 		fmt.Println("Upgrade with:")
