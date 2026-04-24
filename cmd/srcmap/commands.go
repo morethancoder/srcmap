@@ -442,11 +442,29 @@ func runAgent(cmd *cobra.Command, args []string) error {
 }
 
 func runMCPInstall(cmd *cobra.Command, args []string) error {
-	target := mcp.DetectTarget()
-	if err := mcp.Install(target); err != nil {
+	targetFlag, _ := cmd.Flags().GetString("target")
+	scopeFlag, _ := cmd.Flags().GetString("scope")
+
+	var target mcp.InstallTarget
+	switch targetFlag {
+	case "", "auto":
+		target = mcp.DetectTarget()
+	case string(mcp.TargetClaudeCode), string(mcp.TargetCursor), string(mcp.TargetWindsurf):
+		target = mcp.InstallTarget(targetFlag)
+	default:
+		return fmt.Errorf("unknown --target %q (expected claude-code, cursor, windsurf, or auto)", targetFlag)
+	}
+
+	scope := mcp.InstallScope(scopeFlag)
+	if scope == "" {
+		scope = mcp.ScopeUser
+	}
+
+	path, err := mcp.Install(target, scope)
+	if err != nil {
 		return fmt.Errorf("installing MCP config: %w", err)
 	}
-	fmt.Printf("✓ MCP config written for %s\n", target)
+	fmt.Printf("✓ MCP config written for %s (%s scope): %s\n", target, scope, path)
 	return nil
 }
 

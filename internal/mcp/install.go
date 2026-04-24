@@ -18,23 +18,37 @@ const (
 	TargetWindsurf   InstallTarget = "windsurf"
 )
 
-// Install writes the MCP server configuration for the given target.
-func Install(target InstallTarget) error {
-	binaryPath, err := findBinary()
-	if err != nil {
-		return fmt.Errorf("finding srcmap binary: %w", err)
+// InstallScope controls whether the MCP config is written at the user level
+// (available in every project) or at the current project level.
+type InstallScope string
+
+const (
+	ScopeUser    InstallScope = "user"
+	ScopeProject InstallScope = "project"
+)
+
+// Install writes the MCP server configuration for the given target and scope.
+func Install(target InstallTarget, scope InstallScope) (string, error) {
+	if scope == "" {
+		scope = ScopeUser
+	}
+	if scope != ScopeUser && scope != ScopeProject {
+		return "", fmt.Errorf("unknown scope: %s (expected %q or %q)", scope, ScopeUser, ScopeProject)
 	}
 
-	switch target {
-	case TargetClaudeCode:
-		return installClaudeCode(binaryPath)
-	case TargetCursor:
-		return installCursor(binaryPath)
-	case TargetWindsurf:
-		return installWindsurf(binaryPath)
-	default:
-		return fmt.Errorf("unknown target: %s", target)
+	binaryPath, err := findBinary()
+	if err != nil {
+		return "", fmt.Errorf("finding srcmap binary: %w", err)
 	}
+
+	path, err := configPathFor(target, scope)
+	if err != nil {
+		return "", err
+	}
+	if err := writeMCPConfig(path, binaryPath); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // DetectTarget tries to detect which MCP client is available.
@@ -78,21 +92,31 @@ type mcpServerConfig struct {
 	Args    []string `json:"args"`
 }
 
-func installClaudeCode(binaryPath string) error {
+func configPathFor(target InstallTarget, scope InstallScope) (string, error) {
 	home, _ := os.UserHomeDir()
-	configPath := filepath.Join(home, ".claude", "settings.json")
-	return writeMCPConfig(configPath, binaryPath)
-}
 
-func installCursor(binaryPath string) error {
-	configPath := filepath.Join(".cursor", "mcp.json")
-	return writeMCPConfig(configPath, binaryPath)
-}
-
-func installWindsurf(binaryPath string) error {
-	home, _ := os.UserHomeDir()
-	configPath := filepath.Join(home, ".codeium", "windsurf", "mcp_config.json")
-	return writeMCPConfig(configPath, binaryPath)
+	switch target {
+	case TargetClaudeCode:
+		switch scope {
+		case ScopeUser:
+			return filepath.Join(home, ".claude", "settings.json"), nil
+		case ScopeProject:
+			return ".mcp.json", nil
+		}
+	case TargetCursor:
+		switch scope {
+		case ScopeUser:
+			return filepath.Join(home, ".cursor", "mcp.json"), nil
+		case ScopeProject:
+			return filepath.Join(".cursor", "mcp.json"), nil
+		}
+	case TargetWindsurf:
+		if scope == ScopeProject {
+			return "", fmt.Errorf("windsurf does not support project-scope MCP config; use --scope user")
+		}
+		return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"), nil
+	}
+	return "", fmt.Errorf("unknown target: %s", target)
 }
 
 func writeMCPConfig(configPath, binaryPath string) error {

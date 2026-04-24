@@ -103,19 +103,50 @@ srcmap docs add mylib --markdown ./docs
 srcmap sources        # list all sources with version and last updated
 srcmap list           # compact source listing
 srcmap check          # show pending/processed/failed chunk counts
+srcmap outdated       # query upstream registries for newer versions
 ```
+
+### Update a source
+
+```bash
+srcmap update zod                  # re-parse whatever is on disk
+srcmap update zod --refetch        # pull the latest upstream version and re-index
+srcmap update --all --refetch      # update every indexed source to latest
+```
+
+Exactly the same flow is exposed via MCP as `srcmap_update_source` and `srcmap_outdated`, so an agent can do "update source X" in one tool call.
 
 ## Using as an MCP Server (Claude Code, Cursor, Windsurf)
 
-### Claude Code
+First make sure the `srcmap` binary is on your `$PATH` — if you haven't already, run the `go install` command from [Installation](#installation). The MCP config below points to the `srcmap` command by name, so it has to be resolvable from the shell your AI tool launches.
 
-Run the auto-installer:
+The auto-installer detects your AI tool (Claude Code, Cursor, or Windsurf) and writes the correct config file:
 
 ```bash
+# Install at user scope — available in every project (default)
 srcmap mcp install
+
+# Install at project scope — only for the current directory
+srcmap mcp install --scope project
+
+# Force a specific tool instead of auto-detecting
+srcmap mcp install --target claude-code
+srcmap mcp install --target cursor --scope project
 ```
 
-Or manually add to `~/.claude/settings.json`:
+Scopes per tool:
+
+| Tool        | `--scope user` (default)                       | `--scope project`          |
+| ----------- | ---------------------------------------------- | -------------------------- |
+| Claude Code | `~/.claude/settings.json`                      | `./.mcp.json`              |
+| Cursor      | `~/.cursor/mcp.json`                           | `./.cursor/mcp.json`       |
+| Windsurf    | `~/.codeium/windsurf/mcp_config.json`          | _not supported_            |
+
+Restart your AI tool after running the installer, then verify srcmap is connected (in Claude Code, run `/mcp`).
+
+### Manual config
+
+If you'd rather edit the config file yourself, add this block (paths are the ones in the table above):
 
 ```json
 {
@@ -128,53 +159,39 @@ Or manually add to `~/.claude/settings.json`:
 }
 ```
 
-### Cursor
-
-Add to `.cursor/mcp.json` in your project:
-
-```json
-{
-  "mcpServers": {
-    "srcmap": {
-      "command": "srcmap",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-### Windsurf
-
-Add to `~/.codeium/windsurf/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "srcmap": {
-      "command": "srcmap",
-      "args": ["mcp"]
-    }
-  }
-}
-```
 
 ### Available MCP Tools
 
-Once connected, the agent has access to these tools:
+Once connected, the agent has access to these tools. Descriptions encode the
+intended workflow so the agent picks the right tool without reading the code.
+
+**Discovery** (always available)
 
 | Tool | Description |
 |------|-------------|
-| `srcmap_lookup` | Look up a specific symbol — returns file, line range, params, return type |
-| `srcmap_search_code` | Search symbols by name pattern |
-| `srcmap_doc_map` | Get the root doc index for a source |
-| `srcmap_doc_section` | Get a section's method listing |
-| `srcmap_doc_lookup` | Get full method documentation |
-| `srcmap_doc_concept` | Get concept documentation |
-| `srcmap_doc_search` | Fuzzy search across all doc files |
-| `srcmap_doc_gotchas` | Get known gotchas for a source |
-| `srcmap_source_info` | Get source metadata and stats |
-| `srcmap_process_chunk` | Process a pre-chunked doc block into structured output |
-| `srcmap_process_status` | Check pending/processed/failed chunk counts |
+| `srcmap_list_sources` | List every indexed source — start here when unsure what is available |
+| `srcmap_source_info` | Metadata + doc-ingest status for one source |
+| `srcmap_find` | **Preferred search** — exact name match + FTS5 ranked snippets in one call |
+| `srcmap_lookup` | Exact-name symbol lookup (file, line range, params, return type) |
+| `srcmap_search_code` | Substring search over parsed code symbols |
+| `srcmap_doc_map` | Root `index.md` — the top-level doc map |
+| `srcmap_doc_section` | Listing of methods + concepts in a section |
+| `srcmap_doc_lookup` | Full method documentation |
+| `srcmap_doc_concept` | Full concept documentation |
+| `srcmap_doc_search` | FTS5 ranked doc search (prefer `srcmap_find`) |
+| `srcmap_doc_gotchas` | Known footguns and breaking changes |
+| `srcmap_process_chunk` / `srcmap_process_all` / `srcmap_process_status` | Finer-grained chunk processing controls |
+| `srcmap_delete_source` | Permanently remove a source (destructive) |
+
+**Write / update** (available only when the server runs from a project directory)
+
+| Tool | Description |
+|------|-------------|
+| `srcmap_fetch` | Clone a package, parse symbols, auto-ingest local docs |
+| `srcmap_docs_add` | One-call ingestion of a docs URL — auto-detects llms.txt / OpenAPI / HTML |
+| `srcmap_ingest_local_docs` | Offline fallback — ingest only README + docs/ folder |
+| `srcmap_update_source` | Re-fetch latest upstream version, re-parse, re-ingest (handles "update X" in one call) |
+| `srcmap_outdated` | Check every source against its registry and report which are behind |
 
 ## Using as a Standalone Agent
 
@@ -236,11 +253,12 @@ srcmap lookup <source> <symbol>                # look up a specific symbol
 srcmap search <source> <query>                 # search symbols by name
 srcmap list                                    # list indexed sources
 srcmap sources [--global]                      # list sources with details
-srcmap update <source> [--full] [--all]        # re-index a source
-srcmap check                                   # check for pending updates
+srcmap update <source> [--refetch] [--full] [--all]  # refresh a source (optionally pull latest from upstream)
+srcmap outdated                                      # show which sources are behind upstream
+srcmap check                                         # show pending/processed/failed chunk counts
 srcmap link <source>                           # link global source to local project
 srcmap mcp                                     # start MCP server (stdio)
-srcmap mcp install                             # auto-install MCP config
+srcmap mcp install [--scope user|project]      # auto-install MCP config (default: user)
 srcmap agent                                   # start interactive terminal chat
 ```
 

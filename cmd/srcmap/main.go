@@ -78,7 +78,17 @@ var mcpCmd = &cobra.Command{
 var mcpInstallCmd = &cobra.Command{
 	Use:   "install",
 	Short: "Auto-detect and write MCP config for Claude Code, Cursor, or Windsurf",
-	RunE:  runMCPInstall,
+	Long: `Write the srcmap MCP server config for an AI coding tool.
+
+By default, installs at user scope so srcmap is available in every project.
+Use --scope project to install only for the current directory.
+
+Examples:
+  srcmap mcp install                            # user scope, auto-detected tool
+  srcmap mcp install --scope project            # current project only
+  srcmap mcp install --target claude-code       # force Claude Code
+  srcmap mcp install --target cursor --scope project`,
+	RunE: runMCPInstall,
 }
 
 var agentCmd = &cobra.Command{
@@ -118,6 +128,8 @@ func init() {
 	sourcesCmd.Flags().Bool("global", false, "List global sources")
 
 	// mcp subcommands
+	mcpInstallCmd.Flags().String("scope", "user", "Install scope: 'user' (every project) or 'project' (current directory only)")
+	mcpInstallCmd.Flags().String("target", "auto", "Target tool: claude-code, cursor, windsurf, or auto")
 	mcpCmd.AddCommand(mcpInstallCmd)
 
 	// register all commands
