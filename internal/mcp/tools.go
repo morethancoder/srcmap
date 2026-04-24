@@ -688,8 +688,9 @@ func (h *ToolHandler) handleProcessAll(args map[string]interface{}) (*ToolResult
 	}
 	output = append(output, fmt.Sprintf("  Sections: %d", len(sections)))
 	output = append(output, fmt.Sprintf("  Methods: %d | Concepts: %d | Gotchas: %d", methods, concepts, gotchas))
-	output = append(output, fmt.Sprintf("\nDoc files written to .srcmap/docs/%s/", source))
-	output = append(output, "Use srcmap_doc_map, srcmap_doc_section, srcmap_doc_lookup, srcmap_doc_concept to query.")
+	output = append(output, fmt.Sprintf("\n▸ index.md + per-section maps (re)built at .srcmap/docs/%s/", source))
+	output = append(output, fmt.Sprintf("▸ Navigate: srcmap_doc_map(source=%q) → srcmap_doc_section → srcmap_doc_lookup / srcmap_doc_concept.", source))
+	output = append(output, fmt.Sprintf("▸ Index descriptions are auto-stubbed (\"Documentation for X\"). Replace with real ones via srcmap_write_map(source=%q, sections=[...]).", source))
 
 	return textResult(strings.Join(output, "\n")), nil
 }
@@ -911,6 +912,70 @@ func (h *ToolHandler) ensureGotchasFile(source string) {
 	_ = os.WriteFile(path, []byte("# Gotchas\n\n_No gotchas recorded for this source yet._\n"), 0o644)
 }
 
+// writeStubMap writes a minimal index.md for a freshly-fetched source so
+// srcmap_doc_map has something to serve immediately. Lists symbols grouped
+// by kind. Skipped when a curated map (non-stub or with <!-- custom --> block)
+// already exists. Overwritten by srcmap_write_map or srcmap_process_all.
+func (h *ToolHandler) writeStubMap(source string, symbols []parser.Symbol) {
+	if source == "" || len(symbols) == 0 {
+		return
+	}
+	docsDir := filepath.Join(h.SrcmapDir, "docs", source)
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		return
+	}
+	indexPath := filepath.Join(docsDir, "index.md")
+	if existing, err := os.ReadFile(indexPath); err == nil {
+		// Don't clobber a curated or customized map.
+		if strings.Contains(string(existing), "<!-- custom -->") ||
+			strings.Contains(string(existing), "stub: false") {
+			return
+		}
+	}
+
+	const maxPerKind = 15
+	buckets := map[parser.SymbolKind][]string{}
+	for _, s := range symbols {
+		if len(buckets[s.Kind]) >= maxPerKind {
+			continue
+		}
+		name := s.Name
+		if s.ParentScope != "" {
+			name = s.ParentScope + "." + s.Name
+		}
+		buckets[s.Kind] = append(buckets[s.Kind], name)
+	}
+
+	order := []parser.SymbolKind{
+		parser.SymbolType, parser.SymbolInterface, parser.SymbolClass,
+		parser.SymbolFunction, parser.SymbolMethod, parser.SymbolConstant,
+	}
+
+	var body strings.Builder
+	body.WriteString("\n# Index (stub)\n\n")
+	body.WriteString("_Auto-generated placeholder listing the top symbols in this source._\n\n")
+	body.WriteString(fmt.Sprintf("**Total symbols indexed:** %d\n\n", len(symbols)))
+	body.WriteString("**To curate this map:**\n")
+	body.WriteString(fmt.Sprintf("- `srcmap_write_map(source=%q, sections=[...])` — write a real, section-level overview\n", source))
+	body.WriteString(fmt.Sprintf("- `srcmap_docs_add(source=%q, url=<docs URL>)` — ingest upstream docs first for richer sections\n\n", source))
+
+	for _, kind := range order {
+		entries := buckets[kind]
+		if len(entries) == 0 {
+			continue
+		}
+		label := strings.ToUpper(string(kind)[:1]) + string(kind)[1:] + "s"
+		body.WriteString(fmt.Sprintf("## %s\n\n", label))
+		for _, name := range entries {
+			body.WriteString(fmt.Sprintf("- `%s`\n", name))
+		}
+		body.WriteString("\n")
+	}
+
+	content := "---\nid: index\nkind: index\nauto_generated: true\nstub: true\nlast_updated: \"" + fileformat.Now() + "\"\n---\n" + body.String()
+	_ = os.WriteFile(indexPath, []byte(content), 0o644)
+}
+
 func (h *ToolHandler) handleProcessStatus(args map[string]interface{}) (*ToolResult, error) {
 	source, _ := args["source"].(string)
 	pending, processed, failed, err := h.DB.ChunkCounts(source)
@@ -1028,6 +1093,11 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 		}
 		output = append(output, fmt.Sprintf("✓ %s@%s fetched and indexed %d symbols", r.Source.Name, r.Source.Version, indexed))
 
+		// Write a stub index.md so srcmap_doc_map has something to serve
+		// immediately, and so srcmap_write_map has something to overwrite.
+		h.writeStubMap(r.Source.Name, symbols)
+		output = append(output, fmt.Sprintf("  stub map → .srcmap/docs/%s/index.md", r.Source.Name))
+
 		// Doc ingestion directive for the calling LLM agent.
 		// The agent should research the best docs URL (web search, llms.txt,
 		// official docs) and then call srcmap_docs_add to fetch+map them to
@@ -1038,6 +1108,9 @@ func (h *ToolHandler) handleFetch(ctx context.Context, args map[string]interface
 		output = append(output, "  "+docfetcher.SearchPrompt(r.Source.Name))
 		output = append(output, fmt.Sprintf("  Then call: srcmap_docs_add(source=%q, url=<discovered_url>)", r.Source.Name))
 		output = append(output, fmt.Sprintf("  Offline fallback: srcmap_ingest_local_docs(source=%q)", r.Source.Name))
+		output = append(output, "")
+		output = append(output, "▸ OR curate the map right now (no docs ingestion required):")
+		output = append(output, fmt.Sprintf("  srcmap_write_map(source=%q, overview=\"<1-3 sentences>\", sections=[{name, description}, ...])", r.Source.Name))
 	}
 
 	return textResult(strings.Join(output, "\n")), nil
